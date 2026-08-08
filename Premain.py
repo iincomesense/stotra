@@ -1,355 +1,300 @@
-import streamlit as st
+import os
+import requests
 import yfinance as yf
 import pandas as pd
-import requests
+import streamlit as st
+import datetime
+import pytz
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
-import datetime
+from email.utils import parsedate_to_datetime
 
 # -----------------------------------------------------------------------------
-# 1. PAGE CONFIGURATION & CUSTOM MOBILE-FIRST SENIOR UI/UX CSS
+# 1. Page Configuration & Senior Mobile/Tablet UX CSS
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="PRO MARKET TERMINAL & DELIVERY SCANNER",
-    page_icon="📈",
+    page_title="PRO LIVE MARKET ALERTS & NEWS TERMINAL",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Advanced Mobile-First CSS Fix for Streamlit
+# Custom Responsive Dark Theme CSS for Mobile & Tablet
 st.markdown("""
 <style>
-    /* Dark Theme Base */
-    .stApp {
-        background-color: #0d1117;
-        color: #c9d1d9;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
+    .stApp { background-color: #0d1117; color: #c9d1d9; }
     
-    /* Header Styling */
-    .main-header {
+    .header-box {
         background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
-        padding: 15px;
-        border-radius: 12px;
-        border: 1px solid #374151;
-        margin-bottom: 20px;
-        text-align: center;
+        padding: 15px; border-radius: 12px; border: 1px solid #374151;
+        text-align: center; margin-bottom: 20px;
     }
     
-    /* Responsive Grid for Mobile Devices */
-    .macro-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-        gap: 10px;
-        margin-bottom: 20px;
-    }
-    
-    .macro-card {
+    /* Responsive Alert Cards */
+    .alert-card {
         background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 10px;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        border-left: 5px solid #ef4444;
+        border-radius: 8px; padding: 12px; margin-bottom: 12px;
+        border-top: 1px solid #30363d; border-right: 1px solid #30363d; border-bottom: 1px solid #30363d;
     }
-    
-    .macro-title {
-        font-size: 0.75rem;
-        color: #8b949e;
-        font-weight: 600;
-        text-transform: uppercase;
+    .alert-bullish { border-left-color: #22c55e !important; }
+    .alert-bearish { border-left-color: #ef4444 !important; }
+    .alert-volume  { border-left-color: #eab308 !important; }
+
+    .tag {
+        display: inline-block; padding: 2px 8px; border-radius: 4px;
+        font-size: 0.75rem; font-weight: bold; color: #ffffff; margin-right: 5px;
     }
-    
-    .macro-val {
-        font-size: 1rem;
-        font-weight: 700;
-        margin: 4px 0;
-    }
-    
-    .pos { color: #22c55e; }
-    .neg { color: #ef4444; }
-    
-    /* Stock Section Card */
-    .stock-card {
-        background: #161b22;
-        border-left: 4px solid #3b82f6;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 15px;
-        border-top: 1px solid #30363d;
-        border-right: 1px solid #30363d;
-        border-bottom: 1px solid #30363d;
-    }
-    
-    /* Direct Link Buttons */
+    .tag-time { background-color: #3b82f6; }
+    .tag-type { background-color: #8b5cf6; }
+
     .btn-link {
-        display: inline-block;
-        padding: 6px 12px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #ffffff !important;
-        background-color: #2563eb;
-        border-radius: 6px;
-        text-decoration: none !important;
-        margin-right: 8px;
-        margin-top: 5px;
+        display: inline-block; padding: 6px 12px; font-size: 0.8rem;
+        font-weight: 600; color: #ffffff !important; background-color: #2563eb;
+        border-radius: 6px; text-decoration: none !important; margin-top: 8px;
     }
     .btn-link:hover { background-color: #1d4ed8; }
-    
-    .btn-tv {
-        background-color: #2962ff;
-    }
-    
-    .btn-news {
-        background-color: #059669;
-    }
-    
-    /* Delivery Table Styling */
-    .streak-badge {
-        background-color: #065f46;
-        color: #34d399;
-        padding: 3px 8px;
-        border-radius: 12px;
-        font-size: 0.75rem;
-        font-weight: bold;
-    }
-    
-    /* Custom Responsive Tables */
-    table {
-        width: 100% !important;
-        color: #c9d1d9 !important;
-        border-collapse: collapse !important;
-    }
-    th, td {
-        padding: 8px 10px !important;
-        border: 1px solid #30363d !important;
-        font-size: 0.85rem !important;
-    }
-    th {
-        background-color: #21262d !important;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. REAL-TIME MULTI-SOURCE NO-CACHE NEWS ENGINE
+# 2. Time & Session Management (4:00 PM Auto-Delete/Reset Logic)
 # -----------------------------------------------------------------------------
-def fetch_live_multi_news(stock_name):
-    """
-    Fetches real-time news strictly without caching from major portals:
-    Moneycontrol, Economic Times, Bloomberg, Investing.com, StockEdge, NSE
-    """
-    # Strict search query for specified financial sources
-    query = f"{stock_name} share news site:moneycontrol.com OR site:economictimes.indiatimes.com OR site:stockedge.com OR site:investing.com OR site:bloomberg.com"
-    encoded_query = quote(query)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
+ist_tz = pytz.timezone('Asia/Kolkata')
+now_ist = datetime.datetime.now(ist_tz)
+
+if 'alerts_history' not in st.session_state:
+    st.session_state.alerts_history = []
+if 'last_reset_date' not in st.session_state:
+    st.session_state.last_reset_date = now_ist.date()
+
+# शाम 4:00 PM (16:00 IST) के बाद या नए दिन की शुरुआत में अलर्ट डिलीट/रीसेट
+if now_ist.hour >= 16 or st.session_state.last_reset_date != now_ist.date():
+    st.session_state.alerts_history = []
+    st.session_state.last_reset_date = now_ist.date()
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+WATCHLIST = ["TCS", "M&M", "HCLTECH", "SBIN", "INFY", "RELIANCE", "BHARTIARTL", "BEL", "ONGC", "TATAMOTORS", "HDFCBANK", "ICICIBANK", "BAJFINANCE"]
+
+def send_telegram(msg):
+    if BOT_TOKEN and CHAT_ID:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+        except Exception:
+            pass
+
+# -----------------------------------------------------------------------------
+# 3. Multi-Timeframe EMA & Volume Alert Engine
+# -----------------------------------------------------------------------------
+def analyze_stock_timeframe(stock_sym, df, tf_label):
+    if len(df) < 50:
+        return []
+
+    alerts = []
+    df = df.copy()
     
-    # Custom headers to bypass server cache completely
+    # EMA 20 & EMA 50 Calculation
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    
+    # 20-Period Average Volume Calculation
+    df['VolAvg20'] = df['Volume'].rolling(window=20).mean()
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    curr_price = curr['Close']
+    curr_vol = curr['Volume']
+    avg_vol = curr['VolAvg20']
+
+    # 1. EMA 20/50 Crossover Check (Cross Up & Cross Down)
+    if prev['EMA20'] <= prev['EMA50'] and curr['EMA20'] > curr['EMA50']:
+        alerts.append({
+            "type": "EMA CROSS UP",
+            "stock": stock_sym,
+            "tf": tf_label,
+            "msg": f"🚀 *EMA 20/50 CROSS UP ({tf_label})*: `{stock_sym}`\n▫ EMA 20 ने EMA 50 को ऊपर की ओर काटा\n▫ LTP: ₹{curr_price:.2f}",
+            "bullish": True
+        })
+    elif prev['EMA20'] >= prev['EMA50'] and curr['EMA20'] < curr['EMA50']:
+        alerts.append({
+            "type": "EMA CROSS DOWN",
+            "stock": stock_sym,
+            "tf": tf_label,
+            "msg": f"🚨 *EMA 20/50 CROSS DOWN ({tf_label})*: `{stock_sym}`\n▫ EMA 20 ने EMA 50 को नीचे की ओर काटा\n▫ LTP: ₹{curr_price:.2f}",
+            "bullish": False
+        })
+
+    # 2. Volume > 2x 20-Period Average Volume Check
+    if avg_vol > 0 and (curr_vol / avg_vol) >= 2.0:
+        ratio = curr_vol / avg_vol
+        alerts.append({
+            "type": "2X VOLUME SPIKE",
+            "stock": stock_sym,
+            "tf": tf_label,
+            "msg": f"⚡ *2X VOLUME SPIKE ({tf_label})*: `{stock_sym}`\n▫ वॉल्यूम उछाल: {ratio:.1f}x (20d Avg से दोगुना)\n▫ LTP: ₹{curr_price:.2f}",
+            "bullish": None
+        })
+
+    return alerts
+
+def scan_all_timeframes():
+    symbols = [f"{s}.NS" for s in WATCHLIST]
+    new_alerts = []
+
+    try:
+        # 1. Daily Data Fetch
+        df_daily = yf.download(symbols, period="100d", interval="1d", progress=False)
+        # 2. 1-Hour Data Fetch
+        df_1h = yf.download(symbols, period="30d", interval="1h", progress=False)
+        # 3. 5-Min Data Fetch (Resampled to 10-Min)
+        df_5m = yf.download(symbols, period="5d", interval="5m", progress=False)
+
+        for stock in WATCHLIST:
+            sym = f"{stock}.NS"
+
+            # Process Daily
+            if 'Close' in df_daily and sym in df_daily['Close']:
+                d_df = pd.DataFrame({'Close': df_daily['Close'][sym], 'Volume': df_daily['Volume'][sym]}).dropna()
+                new_alerts.extend(analyze_stock_timeframe(stock, d_df, "Daily"))
+
+            # Process 1-Hour
+            if 'Close' in df_1h and sym in df_1h['Close']:
+                h_df = pd.DataFrame({'Close': df_1h['Close'][sym], 'Volume': df_1h['Volume'][sym]}).dropna()
+                new_alerts.extend(analyze_stock_timeframe(stock, h_df, "1 Hour"))
+
+            # Process 10-Min (Resample 5m to 10m)
+            if 'Close' in df_5m and sym in df_5m['Close']:
+                m_df = pd.DataFrame({'Close': df_5m['Close'][sym], 'Volume': df_5m['Volume'][sym]}).dropna()
+                m10_df = m_df.resample('10min').agg({'Close': 'last', 'Volume': 'sum'}).dropna()
+                new_alerts.extend(analyze_stock_timeframe(stock, m10_df, "10 Min"))
+
+    except Exception as e:
+        print(f"Error scanning market: {e}")
+
+    # Add to session history & avoid duplicates
+    for alt in new_alerts:
+        alt["time"] = datetime.datetime.now(ist_tz).strftime("%I:%M %p")
+        if not any(x['msg'] == alt['msg'] for x in st.session_state.alerts_history):
+            st.session_state.alerts_history.insert(0, alt)
+            send_telegram(alt['msg'])
+
+# -----------------------------------------------------------------------------
+# 4. Strict Zero-Cache Real-Time News Engine (< 24 Hours Filter)
+# -----------------------------------------------------------------------------
+def fetch_strict_24h_news(stock_name):
+    """
+    Fetches real-time RSS news strictly from:
+    moneycontrol.com, bloomberg.com, investing.com, tradingeconomics.com, nseindia.com, stockedge.com
+    Excludes any news older than 24 hours. Zero caching.
+    """
+    sites = "site:moneycontrol.com OR site:bloomberg.com OR site:investing.com OR site:tradingeconomics.com OR site:nseindia.com OR site:stockedge.com"
+    query = f"{stock_name} share news ({sites})"
+    rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0'
     }
-    
-    news_items = []
-    try:
-        response = requests.get(rss_url, headers=headers, timeout=6)
-        if response.status_code == 200:
-            root = ET.fromstring(response.content)
-            for item in root.findall('./channel/item')[:3]:  # Top 3 latest news
-                title = item.find('title').text if item.find('title') is not None else 'Market Update'
-                link = item.find('link').text if item.find('link') is not None else '#'
-                pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ''
-                
-                # Format time
-                clean_date = pub_date[:16] if pub_date else "Just Now"
-                news_items.append({"title": title, "link": link, "time": clean_date})
-    except Exception as e:
-        news_items.append({"title": f"Live news available on TradingView/NSE for {stock_name}", "link": f"https://in.tradingview.com/chart/?symbol=NSE:{stock_name}", "time": "Live"})
-    
-    return news_items
 
-# -----------------------------------------------------------------------------
-# 3. 5-DAY CONSECUTIVE DELIVERY % & VOLUME SCANNER
-# -----------------------------------------------------------------------------
-def fetch_delivery_and_volume_streaks(watchlist):
-    """
-    Scans Watchlist for stocks showing 5 consecutive days of increasing Volume and Delivery %
-    """
-    symbols = [f"{s}.NS" for s in watchlist]
-    streak_results = []
-    
+    fresh_news = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+
     try:
-        # Download 10 days of data to compute 5-day consecutive streaks
-        df = yf.download(symbols, period="12d", interval="1d", progress=False)
-        volume_df = df['Volume']
-        close_df = df['Close']
-        
-        for stock in watchlist:
-            sym = f"{stock}.NS"
-            if sym in volume_df:
-                v_series = volume_df[sym].dropna().tail(5)
-                c_series = close_df[sym].dropna().tail(5)
-                
-                if len(v_series) == 5:
-                    v_vals = v_series.values
-                    c_vals = c_series.values
-                    
-                    # Check if Volume is increasing consecutively for 5 days: V1 < V2 < V3 < V4 < V5
-                    vol_increasing = all(v_vals[i] < v_vals[i+1] for i in range(len(v_vals)-1))
-                    
-                    # Calculate estimated delivery growth trend (Delivery Proxy from Vol & Price movement)
-                    # For precise exchange Delivery %, nsepython can be integrated
-                    if vol_increasing:
-                        pct_change = ((c_vals[-1] - c_vals[0]) / c_vals[0]) * 100
-                        streak_results.append({
-                            "stock": stock,
-                            "price": c_vals[-1],
-                            "change": pct_change,
-                            "volumes": v_vals,
-                            "dates": [d.strftime('%d/%m') for d in v_series.index]
-                        })
+        res = requests.get(rss_url, headers=headers, timeout=6)
+        if res.status_code == 200:
+            root = ET.fromstring(res.content)
+            for item in root.findall('./channel/item')[:5]:
+                title = item.find('title').text if item.find('title') is not None else 'Market News'
+                link = item.find('link').text if item.find('link') is not None else '#'
+                pub_date_str = item.find('pubDate').text if item.find('pubDate') is not None else None
+
+                if pub_date_str:
+                    pub_dt = parsedate_to_datetime(pub_date_str)
+                    # Check if news is strictly within the last 24 hours (86400 seconds)
+                    time_diff = (now - pub_dt).total_seconds()
+                    if time_diff <= 86400:
+                        hrs_ago = int(time_diff // 3600)
+                        mins_ago = int((time_diff % 3600) // 60)
+                        time_label = f"{hrs_ago}h {mins_ago}m ago" if hrs_ago > 0 else f"{mins_ago}m ago"
+                        fresh_news.append({"title": title, "link": link, "time": time_label})
     except Exception as e:
         pass
-        
-    return streak_results
+
+    return fresh_news
 
 # -----------------------------------------------------------------------------
-# 4. MAIN APP HEADER & GLOBAL MACRO (MOBILE FLEX GRID)
+# 5. UI Layout & Dashboard Render
 # -----------------------------------------------------------------------------
 st.markdown("""
-<div class="main-header">
-    <h2 style="margin:0; color:#60a5fa;">📊 PRO MARKET TERMINAL & NEWS ANALYZER</h2>
+<div class="header-box">
+    <h2 style="margin:0; color:#60a5fa;">⚡ LIVE MARKET WATCHLIST TERMINAL</h2>
     <p style="margin:5px 0 0 0; font-size:0.85rem; color:#9ca3af;">
-        🔴 Live Real-Time Feeds | 5-Day Consecutive Delivery & Volume Tracker
+        EMA 20/50 Crossovers | 2x Volume Spikes | 10m, 1h, Daily Timeframes | Auto-Clears at 4:00 PM IST
     </p>
 </div>
 """, unsafe_allow_html=True)
 
-# 1. Global Macro Indicators (Fixed Squeezed Mobile Layout)
-st.subheader("🌐 1. Global Macro Indicators")
+col_left, col_right = st.columns([1.2, 1])
 
-macro_data = [
-    {"name": "Crude Oil", "val": "$77.20", "chg": "+1.2%", "pos": True},
-    {"name": "Gold", "val": "$2,430", "chg": "+0.5%", "pos": True},
-    {"name": "Dollar Index", "val": "103.10", "chg": "-0.3%", "pos": False},
-    {"name": "US 10Y Yield", "val": "3.88%", "chg": "-0.8%", "pos": False},
-    {"name": "USD / INR", "val": "₹83.92", "chg": "+0.1%", "pos": True},
-    {"name": "S&P 500", "val": "5,344", "chg": "+0.8%", "pos": True},
-    {"name": "NASDAQ", "val": "16,745", "chg": "+1.1%", "pos": True},
-    {"name": "GIFT Nifty", "val": "24,380", "chg": "+0.4%", "pos": True},
-]
+with col_left:
+    st.subheader("🔔 आज के लाइव अलर्ट्स (4 PM तक स्टोर रहेंगे)")
+    
+    if st.button("🔄 स्कैन करें / रिफ्रेश करें"):
+        with st.spinner("10m, 1h और Daily डेटा स्कैन हो रहा है..."):
+            scan_all_timeframes()
 
-macro_html = '<div class="macro-grid">'
-for m in macro_data:
-    color_cls = "pos" if m["pos"] else "neg"
-    tv_url = f"https://in.tradingview.com/chart/?symbol={quote(m['name'])}"
-    macro_html += f"""
-    <div class="macro-card">
-        <div class="macro-title">{m['name']}</div>
-        <div class="macro-val {color_cls}">{m['val']}</div>
-        <div style="font-size:0.75rem;" class="{color_cls}">{m['chg']}</div>
-        <a href="{tv_url}" target="_blank" style="font-size:0.65rem; color:#60a5fa; text-decoration:none;">Chart ↗</a>
-    </div>
-    """
-macro_html += '</div>'
-st.markdown(macro_html, unsafe_allow_html=True)
+    if now_ist.hour >= 16:
+        st.warning("⏰ शाम के 4:00 PM बज चुके हैं। आज के सभी अलर्ट्स रीसेट कर दिए गए हैं।")
+    elif not st.session_state.alerts_history:
+        st.info("फ़िलहाल कोई अलर्ट ट्रिगर नहीं हुआ है। मार्केट ऑवर्स के दौरान स्कैन बटन दबाएं या ऑटो-रन होने दें।")
+    else:
+        for alt in st.session_state.alerts_history:
+            cls_name = "alert-volume"
+            if alt["bullish"] is True:
+                cls_name = "alert-bullish"
+            elif alt["bullish"] is False:
+                cls_name = "alert-bearish"
 
-st.markdown("---")
+            tv_url = f"https://in.tradingview.com/chart/?symbol=NSE:{alt['stock']}"
 
-# -----------------------------------------------------------------------------
-# 5. WATCHLIST STOCKS: 5-DAY CONSECUTIVE DELIVERY & VOLUME TRACKER
-# -----------------------------------------------------------------------------
-st.subheader("🔥 2. Stocks with 5 Consecutive Days Volume & Delivery Growth")
-st.caption("स्क्रीनशॉट #3 के अनुसार: ऐसे स्टॉक्स जिनमें पिछले 5 लगातार दिनों से वॉल्यूम और डिलीवरी प्रतिशत में बढ़त दर्ज हुई है।")
-
-WATCHLIST = ["TCS", "M&M", "HCLTECH", "SBIN", "INFY", "RELIANCE", "BHARTIARTL", "BEL", "ONGC", "TATAMOTORS", "HDFCBANK", "ICICIBANK", "BAJFINANCE"]
-
-with st.spinner("स्कैनिंग जारी है... ताज़ा वॉल्यूम और न्यूज़ डेटा लोड हो रहा है..."):
-    streak_stocks = fetch_delivery_and_volume_streaks(WATCHLIST)
-
-if streak_stocks:
-    for item in streak_stocks:
-        stk = item['stock']
-        price = item['price']
-        chg = item['change']
-        v_list = item['volumes']
-        dates = item['dates']
-        
-        tv_link = f"https://in.tradingview.com/chart/?symbol=NSE:{stk}"
-        
-        # Fetch Real-Time Live News (No Cache)
-        news_list = fetch_live_multi_news(stk)
-        
-        chg_color = "#22c55e" if chg >= 0 else "#ef4444"
-        
-        # Render Stock Card
-        st.markdown(f"""
-        <div class="stock-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+            st.markdown(f"""
+            <div class="alert-card {cls_name}">
                 <div>
-                    <span style="font-size:1.2rem; font-weight:bold; color:#f3f4f6;">{stk}</span>
-                    <span class="streak-badge">⚡ 5-Day Consecutive Surge</span>
+                    <span class="tag tag-time">🕒 {alt['time']}</span>
+                    <span class="tag tag-type">⏳ {alt['tf']}</span>
+                    <b style="font-size:1.1rem; color:#f3f4f6;">{alt['stock']}</b>
                 </div>
-                <div style="text-align:right;">
-                    <span style="font-size:1.1rem; font-weight:bold; color:{chg_color};">₹{price:.2f} ({chg:+.2f}%)</span>
+                <div style="margin-top:8px; font-size:0.9rem; color:#e5e7eb;">
+                    {alt['msg']}
                 </div>
+                <a href="{tv_url}" target="_blank" class="btn-link">📈 Open Live Chart</a>
             </div>
-            
-            <div style="margin-top:10px;">
-                <p style="margin:0; font-size:0.8rem; color:#9ca3af;"><b>5-Day Volume Trend (लगातार वृद्धि):</b></p>
-                <div style="font-size:0.75rem; color:#d1d5db; margin-top:2px;">
-                    📅 {dates[0]}: {v_list[0]:,} ➔ 📅 {dates[1]}: {v_list[1]:,} ➔ 📅 {dates[2]}: {v_list[2]:,} ➔ 📅 {dates[3]}: {v_list[3]:,} ➔ 📅 <b>{dates[4]}: {v_list[4]:,}</b>
-                </div>
+            """, unsafe_allow_html=True)
+
+with col_right:
+    st.subheader("📰 ताज़ा real-time ख़बरें (Strictly < 24 Hours)")
+    st.caption("स्रोत: Moneycontrol, Bloomberg, Investing, TradingEconomics, NSE, StockEdge")
+
+    selected_stock = st.selectbox("वॉचलिस्ट से स्टॉक चुनें:", WATCHLIST)
+    
+    with st.spinner(f"{selected_stock} की लाइव ख़बरें लोड हो रही हैं..."):
+        news_items = fetch_strict_24h_news(selected_stock)
+
+    if news_items:
+        for item in news_items:
+            st.markdown(f"""
+            <div style="background-color:#161b22; padding:10px; border-radius:6px; margin-bottom:8px; border:1px solid #30363d;">
+                <a href="{item['link']}" target="_blank" style="color:#60a5fa; font-size:0.88rem; font-weight:600; text-decoration:none;">
+                    🔗 {item['title']}
+                </a>
+                <div style="font-size:0.75rem; color:#9ca3af; margin-top:4px;">⏱️ पोस्ट हुआ: {item['time']}</div>
             </div>
-            
-            <div style="margin-top:12px;">
-                <a href="{tv_link}" target="_blank" class="btn-link btn-tv">📈 TradingView Live Chart</a>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Display Live Verified News Items
-        st.markdown("**📰 संबंधित ताज़ा वास्तविक-समय की ख़बरें (Moneycontrol / Bloomberg / StockEdge Feeds):**")
-        for news in news_list:
-            st.markdown(f"- 🔗 [{news['title']}]({news['link']}) _({news['time']})_")
-        st.write("")
-else:
-    st.info("फ़िलहाल वॉचलिस्ट के स्टॉक्स सामान्य श्रेणी में ट्रेड हो रहे हैं। किसी स्टॉक में 5-दिन लगातार वॉल्यूम ब्रेकआउट आते ही कार्ड यहाँ लाइव अपडेट हो जाएगा।")
-
-st.markdown("---")
-
-# -----------------------------------------------------------------------------
-# 6. ECONOMIC INDICATORS REFERENCE TABLE (SCREENSHOTS #1 & #2)
-# -----------------------------------------------------------------------------
-st.subheader("📑 3. Key Economic Indicators & Asset Class Impact")
-st.caption("स्क्रीनशॉट #1 और #2 के अनुसार: आर्थिक आंकड़ों का डॉलर, सोना, चांदी, बेस मेटल्स और एनर्जी पर प्रभाव।")
-
-macro_table_data = [
-    {"Indicator": "Durable Goods", "Significance": "Leading indicator of production", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "Housing Starts", "Significance": "Measures new residential construction", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "New Home Sales", "Significance": "Triggers wide-reaching ripple effect", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "GDP", "Significance": "Broadest measure of overall economic activity", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "ISM Manufacturing Index", "Significance": "Purchasing managers view into economy", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "Jobless Claims", "Significance": "Labor market condition indicator", "Dollar Impact": "Actual < Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "PPI", "Significance": "Leading indicator of consumer inflation", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "CPI", "Significance": "Primary inflation gauge for Central Bank", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "FOMC Rate Decision", "Significance": "Sets key interest rate benchmark", "Dollar Impact": "Hike in rate = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Neutral", "Energy": "Neutral"},
-    {"Indicator": "QE Tapering", "Significance": "Reduction of central bank liquidity", "Dollar Impact": "Tapering = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-    {"Indicator": "Trade Balance", "Significance": "Export/Import currency demand link", "Dollar Impact": "Actual > Forecast = Good for USD", "Gold": "Negative", "Silver": "Negative", "Base Metals": "Positive", "Energy": "Positive"},
-]
-
-df_macro = pd.DataFrame(macro_table_data)
-
-# WhatsApp Friendly Markdown Table Output Option
-with st.expander("📲 Click to view & copy WhatsApp-Friendly Table Format"):
-    wa_text = "```\n"
-    wa_text += f"{'Indicator':<20} | {'Dollar':<10} | {'Gold':<8} | {'Silver':<8} | {'Metals':<8} | {'Energy':<8}\n"
-    wa_text += "-"*70 + "\n"
-    for row in macro_table_data:
-        wa_text += f"{row['Indicator']:<20} | {'Good' if 'Good' in row['Dollar Impact'] else 'Bad':<10} | {row['Gold']:<8} | {row['Silver']:<8} | {row['Base Metals']:<8} | {row['Energy']:<8}\n"
-    wa_text += "```"
-    st.code(wa_text, language="markdown")
-
-st.dataframe(df_macro, use_container_width=True, hide_index=True)
+            """, unsafe_allow_html=True)
+    else:
+        st.write("पिछले 24 घंटों के दौरान इस स्टॉक पर इन सिलेक्टेड सोर्स से कोई नई ख़बर पोस्ट नहीं हुई है।")
