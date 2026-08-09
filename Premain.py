@@ -10,6 +10,7 @@ Top Gainers/Losers | Important News.
 Deploy: share.streamlit.io -> connect GitHub repo -> main file: app.py
 """
 
+import concurrent.futures
 import io
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -219,8 +220,28 @@ def fetch_nse_json(api_path):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def fetch_fii_dii_stockedge():
+    """StockEdge se FII/DII activity (priority source). JS-heavy site hai isliye
+    best-effort — fail hone par NSE/Moneycontrol par fallback hoga."""
+    urls = [
+        "https://web.stockedge.com/share/fii-dii-activity",
+        "https://web.stockedge.com/fii-dii-trading-activity",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=NSE_HEADERS, timeout=10)
+            tables = pd.read_html(io.StringIO(r.text))
+            for t in tables:
+                if t.shape[1] >= 3 and t.shape[0] >= 3:
+                    return t.head(5)
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_fii_dii_moneycontrol():
-    """NSE block ho to Moneycontrol se fallback scrape."""
+    """NSE aur StockEdge dono block ho to Moneycontrol se fallback scrape."""
     url = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"
     try:
         r = requests.get(url, headers=NSE_HEADERS, timeout=10)
@@ -291,6 +312,7 @@ def find_delivery_rising(stocks):
                     f"{last3[1][0].strftime('%d-%b')}": round(vals[1], 2),
                     f"{last3[2][0].strftime('%d-%b')}": round(vals[2], 2),
                     "बढ़ोतरी": f"{vals[2]-vals[0]:+.2f} pts",
+                    "Chart": tv_link(tv_symbol_for_stock(stock)),
                 })
     return result
 
@@ -305,32 +327,81 @@ def find_delivery_rising(stocks):
 
 # ---------- TAB: GLOBAL MARKETS ----------
 with tab_global:
-    st.subheader("🌍 Global Markets, Currencies, Commodities & Indices")
-    yf_needed = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
-    g_quotes = get_quotes(yf_needed)
+    st.subheader("🌍 Global Markets, Currencies, Commodities & Indices — Live (TradingView)")
+    st.caption("यह widget सीधे TradingView के live data से चलता है — पेज खोलते ही असल-समय भाव दिखेगा।")
 
-    rows = []
-    for sym, name, yft, tvs in GLOBAL_INSTRUMENTS:
-        q = g_quotes.get(yft) if yft else None
-        rows.append({
-            "Symbol": sym, "Name": name,
-            "Price": f"{q['price']:.2f}" if q else "—",
-            "% Chg": f"{q['pct']:+.2f}%" if q else "—",
-            "Chart": tv_link(tvs),
-        })
-    gdf = pd.DataFrame(rows)
-    st.dataframe(
-        gdf, use_container_width=True, hide_index=True,
-        column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+    ticker_items = ",".join(
+        '{"proName": "%s", "title": "%s"}' % (tvs, sym) for sym, _, _, tvs in GLOBAL_INSTRUMENTS
     )
-    st.caption("ZINC, ALUMINIUM, XIN9, NIFTY Futures, GIFT Nifty के लिए Yahoo पर live price नहीं "
-               "मिलता — सिर्फ chart-link दिखेगा।")
+    components.html(
+        f"""
+        <div class="tradingview-widget-container">
+          <div class="tradingview-widget-container__widget"></div>
+          <script type="text/javascript"
+            src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+          {{
+            "symbols": [{ticker_items}],
+            "showSymbolLogo": true, "isTransparent": false, "displayMode": "adaptive",
+            "colorTheme": "light", "locale": "en"
+          }}
+          </script>
+        </div>
+        """, height=80,
+    )
+
+    st.markdown("&nbsp;")
+    st.markdown("**हर instrument का पूरा live chart खोलने के लिए नीचे से क्लिक करें:**")
+    ref_rows = [{"Symbol": sym, "Name": name, "Chart": tv_link(tvs)}
+                for sym, name, _, tvs in GLOBAL_INSTRUMENTS]
+    st.dataframe(
+        pd.DataFrame(ref_rows), use_container_width=True, hide_index=True,
+        column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Live Chart खोलें")},
+    )
 
 # ---------- TAB: STOCK WATCHLIST ----------
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stock_quick_news_link(stock_name):
+    """Watchlist column ke liye — sirf 24h ke andar ki latest news ka link."""
+    if feedparser is None:
+        return None
+    query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        resp = requests.get(url, timeout=10)
+        feed = feedparser.parse(resp.content)
+    except Exception:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=NEWS_MAX_AGE_HOURS)
+    for e in feed.entries[:5]:
+        pub = e.get("published_parsed")
+        if not pub:
+            continue
+        pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
+        if pub_dt >= cutoff:
+            return e.link
+    return None
+
+
+def fetch_news_links_parallel(stocks):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        futures = {ex.submit(fetch_stock_quick_news_link, s): s for s in stocks}
+        for fut in concurrent.futures.as_completed(futures):
+            s = futures[fut]
+            try:
+                results[s] = fut.result()
+            except Exception:
+                results[s] = None
+    return results
+
+
 with tab_stocks:
     st.subheader(f"📋 Stock Watchlist ({len(selected_stocks)} स्टॉक्स)")
     yf_tickers = [yf_ticker_for_stock(s) for s in selected_stocks]
     s_quotes = get_quotes(yf_tickers)
+
+    with st.spinner("हर स्टॉक की ताज़ा news (24h) चेक हो रही है..."):
+        news_links = fetch_news_links_parallel(selected_stocks)
 
     rows = []
     for s in selected_stocks:
@@ -340,12 +411,17 @@ with tab_stocks:
             "LTP": f"{q['price']:.2f}" if q else "—",
             "% Chg": f"{q['pct']:+.2f}%" if q else "—",
             "Chart": tv_link(tv_symbol_for_stock(s)),
+            "News (24h)": news_links.get(s),
         })
     sdf = pd.DataFrame(rows)
     st.dataframe(
         sdf, use_container_width=True, hide_index=True, height=460,
-        column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+        column_config={
+            "Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें"),
+            "News (24h)": st.column_config.LinkColumn("News (24h)", display_text="📰 पढ़ें"),
+        },
     )
+    st.caption("📰 सिर्फ़ वो स्टॉक जिनकी पिछले 24 घंटे में कोई खबर मिली, वहाँ लिंक दिखेगा।")
 
     st.markdown("---")
     st.markdown("**किसी एक स्टॉक की ताज़ा News देखें:**")
@@ -440,13 +516,20 @@ def check_volume_spike(df, mult):
 
 
 with tab_signals:
-    st.subheader("📊 EMA 20×50 Crossover + Volume Spike")
+    st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
+    st.caption("⭐⭐ = EMA Cross और Volume Spike दोनों एक साथ (मज़बूत सिग्नल) · ⭐ = सिर्फ एक सिग्नल")
+
+    local_tf = st.multiselect(
+        "टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()),
+        default=signal_timeframes, key="signals_tf_local",
+    )
+
     is_after_close = now_ist().hour >= CLEAR_HOUR_IST
     if is_after_close:
         st.info("बाज़ार बंद — Intraday (10m/1h) सिग्नल आज के लिए hide हैं। सिर्फ Daily दिखेगा।")
 
     rows = []
-    for tf_key in signal_timeframes:
+    for tf_key in local_tf:
         cfg = TIMEFRAMES[tf_key]
         if cfg["intraday"] and is_after_close:
             continue
@@ -455,35 +538,47 @@ with tab_signals:
             price = df["Close"].iloc[-1]
             bar_time = df.index[-1]
             cross = check_ema_cross(df)
-            if cross:
-                rows.append({"समय": bar_time.strftime("%H:%M %d-%b"), "स्टॉक": stock,
-                             "टाइमफ्रेम": tf_key,
-                             "टाइप": "🟢 EMA Cross UP" if cross == "UP" else "🔴 EMA Cross DOWN",
-                             "LTP": round(price, 2), "डिटेल": "-"})
             vr = check_volume_spike(df, vol_mult)
+            if not cross and not vr:
+                continue
+
+            type_parts = []
+            if cross:
+                type_parts.append("🟢 EMA UP" if cross == "UP" else "🔴 EMA DOWN")
             if vr:
-                rows.append({"समय": bar_time.strftime("%H:%M %d-%b"), "स्टॉक": stock,
-                             "टाइमफ्रेम": tf_key, "टाइप": "⚡ Volume Spike",
-                             "LTP": round(price, 2), "डिटेल": f"{vr:.1f}x"})
+                type_parts.append(f"⚡ Volume {vr:.1f}x")
+            stars = "⭐⭐" if (cross and vr) else "⭐"
+
+            rows.append({
+                "सिग्नल": stars, "स्टॉक": stock, "टाइमफ्रेम": tf_key,
+                "टाइप": " + ".join(type_parts), "LTP": round(price, 2),
+                "समय": bar_time.strftime("%H:%M %d-%b"),
+                "Chart": tv_link(tv_symbol_for_stock(stock)),
+            })
 
     if not rows:
         st.success("अभी कोई नया सिग्नल नहीं है।")
     else:
-        sig_df = pd.DataFrame(rows).sort_values("समय", ascending=False)
+        sig_df = pd.DataFrame(rows)
+        sig_df["_sort"] = sig_df["सिग्नल"].apply(lambda x: 2 if x == "⭐⭐" else 1)
+        sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
 
         def hl(row):
-            if "UP" in row["टाइप"]:
-                return ["background-color:#d4f8d4"] * len(row)
-            if "DOWN" in row["टाइप"]:
-                return ["background-color:#f8d4d4"] * len(row)
-            return ["background-color:#fff2cc"] * len(row)
+            base = "background-color:#e8d4f8" if row["सिग्नल"] == "⭐⭐" else (
+                "background-color:#d4f8d4" if "UP" in row["टाइप"] else
+                "background-color:#f8d4d4" if "DOWN" in row["टाइप"] else
+                "background-color:#fff2cc")
+            return [base] * len(row)
 
-        st.dataframe(sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(
+            sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
+            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+        )
 
 # ---------- TAB: ECONOMIC CALENDAR ----------
 with tab_calendar:
     st.subheader("🗓️ Global + India Economic Calendar")
-    st.caption("Importance (⭐1-3) widget के अंदर filter करें।")
+    st.caption("सिर्फ़ ⭐⭐/⭐⭐⭐ (Medium + High) importance वाले events दिख रहे हैं — 1-star events छुपे हैं।")
     components.html(
         """
         <div class="tradingview-widget-container">
@@ -492,7 +587,7 @@ with tab_calendar:
             src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
           {
             "colorTheme": "light", "isTransparent": false, "width": "100%",
-            "height": "600", "locale": "en", "importanceFilter": "-1,0,1",
+            "height": "600", "locale": "en", "importanceFilter": "0,1",
             "countryFilter": "us,in,cn,jp,gb,eu"
           }
           </script>
@@ -506,21 +601,26 @@ with tab_fii:
 
     with col_fii:
         st.markdown("### 💰 FII / DII Activity (5 दिन)")
-        fii_data = fetch_nse_json("/api/fiidiiTradeReact")
-        if fii_data:
-            fdf = pd.DataFrame(fii_data).head(5)
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-            st.caption("Source: NSE (live)")
+        se_df = fetch_fii_dii_stockedge()
+        if se_df is not None:
+            st.dataframe(se_df, use_container_width=True, hide_index=True)
+            st.caption("Source: StockEdge (live)")
         else:
-            mc_df = fetch_fii_dii_moneycontrol()
-            if mc_df is not None:
-                st.dataframe(mc_df, use_container_width=True, hide_index=True)
-                st.caption("Source: Moneycontrol (fallback — NSE blocked)")
+            fii_data = fetch_nse_json("/api/fiidiiTradeReact")
+            if fii_data:
+                fdf = pd.DataFrame(fii_data).head(5)
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
+                st.caption("Source: NSE (fallback — StockEdge उपलब्ध नहीं)")
             else:
-                st.warning("NSE और Moneycontrol दोनों से live data नहीं मिल पाया। सीधे देखें:")
-                st.markdown("- [NSE FII/DII Reports](https://www.nseindia.com/reports-indices-historical-index-data)")
-                st.markdown("- [Moneycontrol FII/DII](https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php)")
-                st.markdown("- [StockEdge (reference)](https://www.stockedge.com/)")
+                mc_df = fetch_fii_dii_moneycontrol()
+                if mc_df is not None:
+                    st.dataframe(mc_df, use_container_width=True, hide_index=True)
+                    st.caption("Source: Moneycontrol (fallback — StockEdge/NSE दोनों blocked)")
+                else:
+                    st.warning("StockEdge, NSE और Moneycontrol — तीनों से live data नहीं मिल पाया। सीधे देखें:")
+                    st.markdown("- [StockEdge FII/DII](https://web.stockedge.com/share/fii-dii-activity)")
+                    st.markdown("- [NSE FII/DII Reports](https://www.nseindia.com/reports-indices-historical-index-data)")
+                    st.markdown("- [Moneycontrol FII/DII](https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php)")
 
     with col_nifty:
         st.markdown("### 🎯 Nifty 50 — Data-Driven Outlook")
@@ -557,7 +657,16 @@ with tab_fii:
             st.warning("NSE Option-Chain data नहीं मिला। सीधे देखें:")
             st.markdown("- [NSE Option Chain](https://www.nseindia.com/option-chain)")
             st.markdown("- [Moneycontrol Option Chain](https://www.moneycontrol.com/indices/fno/optionchain/nifty)")
-        st.caption("'टॉप एनालिस्ट राय' reliably scrape करना संभव नहीं — यह पैनल असली Option-OI पर आधारित है, वित्तीय सलाह नहीं है।")
+
+        st.markdown("**🔗 Live OI + Macro + Top Analyst Summary (सीधे खोलें):**")
+        st.markdown(
+            "- [Sensibull — Nifty OI Analysis](https://web.sensibull.com/option-chain?tradingsymbol=NIFTY)\n"
+            "- [Trendlyne — Nifty Analysis](https://trendlyne.com/equity/1897/NIFTY/nifty-50/)\n"
+            "- [Upstox — Nifty Option Chain](https://upstox.com/option-chain/nse/nifty-50/)\n"
+            "- [StockEdge — Market Outlook](https://web.stockedge.com/)"
+        )
+        st.caption("'टॉप एनालिस्ट राय' reliably auto-scrape करना संभव नहीं (JS-heavy sites) — ऊपर दिए लिंक खोलते ही "
+                   "उन-उन platforms का live analysis/summary दिखेगा। यह पैनल का OI डेटा असली NSE से है, वित्तीय सलाह नहीं है।")
 
 # ---------- TAB: SECTOR / STOCK MACRO IMPACT ----------
 with tab_sector:
@@ -575,49 +684,74 @@ with tab_sector:
 
     if usdinr and abs(usdinr["pct"]) >= 0.15:
         if usdinr["pct"] > 0:
-            impact_rows.append(("IT/Export (TCS, INFY, HCLTECH, WIPRO, TECHM, COFORGE, PERSISTENT)",
-                                 "🟢 Positive", f"रुपया {usdinr['pct']:+.2f}% कमज़ोर — export revenue का rupee-value बढ़ता है"))
-            impact_rows.append(("Oil Importers/OMC (BPCL, IOC, HINDPETRO)", "🔴 Negative", "Import bill महंगा"))
+            impact_rows.append({"sector": "IT / Export",
+                                 "stocks": ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "PERSISTENT"],
+                                 "signal": "🟢 Positive",
+                                 "reason": f"रुपया {usdinr['pct']:+.2f}% कमज़ोर — export revenue का rupee-value बढ़ता है"})
+            impact_rows.append({"sector": "Oil Importers / OMC", "stocks": ["BPCL", "IOC", "HINDPETRO"],
+                                 "signal": "🔴 Negative", "reason": "Import bill महंगा पड़ेगा"})
         else:
-            impact_rows.append(("IT/Export", "🔴 Negative", f"रुपया {abs(usdinr['pct']):.2f}% मज़बूत — export margin पर दबाव"))
-            impact_rows.append(("Oil Importers/OMC", "🟢 Positive", "Import cost घटेगा"))
+            impact_rows.append({"sector": "IT / Export",
+                                 "stocks": ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "PERSISTENT"],
+                                 "signal": "🔴 Negative",
+                                 "reason": f"रुपया {abs(usdinr['pct']):.2f}% मज़बूत — export margin पर दबाव"})
+            impact_rows.append({"sector": "Oil Importers / OMC", "stocks": ["BPCL", "IOC", "HINDPETRO"],
+                                 "signal": "🟢 Positive", "reason": "Import cost घटेगा"})
 
     if crude and abs(crude["pct"]) >= 0.5:
         if crude["pct"] > 0:
-            impact_rows.append(("ONGC, OIL (Upstream)", "🟢 Positive", f"Crude {crude['pct']:+.2f}% — realisation बेहतर"))
-            impact_rows.append(("BPCL, IOC, HINDPETRO, INDIGO (Aviation), ASIANPAINT", "🔴 Negative", "इनपुट कॉस्ट/ATF महंगा"))
+            impact_rows.append({"sector": "Upstream Oil (ONGC, OIL)", "stocks": ["ONGC", "OIL"],
+                                 "signal": "🟢 Positive", "reason": f"Crude {crude['pct']:+.2f}% — realisation बेहतर"})
+            impact_rows.append({"sector": "OMC / Aviation / Paints",
+                                 "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO", "ASIANPAINT"],
+                                 "signal": "🔴 Negative", "reason": "इनपुट कॉस्ट/ATF महंगा"})
         else:
-            impact_rows.append(("BPCL, IOC, HINDPETRO, INDIGO", "🟢 Positive", f"Crude {crude['pct']:+.2f}% — इनपुट कॉस्ट घटेगा"))
-            impact_rows.append(("ONGC, OIL", "🔴 Negative", "Realisation घटेगा"))
+            impact_rows.append({"sector": "OMC / Aviation", "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO"],
+                                 "signal": "🟢 Positive", "reason": f"Crude {crude['pct']:+.2f}% — इनपुट कॉस्ट घटेगा"})
+            impact_rows.append({"sector": "Upstream Oil", "stocks": ["ONGC", "OIL"],
+                                 "signal": "🔴 Negative", "reason": "Realisation घटेगा"})
 
     if us10y and abs(us10y["pct"]) >= 1.0:
         tag = "🔴 Negative" if us10y["pct"] > 0 else "🟢 Positive"
-        impact_rows.append(("Banks/NBFC/High-Valuation Stocks", tag,
-                             f"US 10Y yield {us10y['pct']:+.2f}% — global risk-appetite/FII flow पर असर"))
+        impact_rows.append({"sector": "Banks / NBFC / High-Valuation Stocks",
+                             "stocks": ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "BAJFINANCE"],
+                             "signal": tag,
+                             "reason": f"US 10Y yield {us10y['pct']:+.2f}% — global risk-appetite/FII flow पर असर"})
 
     if copper and abs(copper["pct"]) >= 0.5:
         tag = "🟢 Positive" if copper["pct"] > 0 else "🔴 Negative"
-        impact_rows.append(("Metals (HINDALCO, VEDL, NATIONALUM, TATASTEEL, JSWSTEEL, JINDALSTEL)",
-                             tag, f"Copper {copper['pct']:+.2f}% — base-metal sentiment"))
+        impact_rows.append({"sector": "Metals",
+                             "stocks": ["HINDALCO", "VEDL", "NATIONALUM", "TATASTEEL", "JSWSTEEL", "JINDALSTEL"],
+                             "signal": tag, "reason": f"Copper {copper['pct']:+.2f}% — base-metal sentiment"})
 
     if gold and abs(gold["pct"]) >= 0.5:
         tag = "🟢 Positive" if gold["pct"] > 0 else "🔴 Negative"
-        impact_rows.append(("Gold-linked (TITAN)", tag, f"Gold {gold['pct']:+.2f}%"))
+        impact_rows.append({"sector": "Gold-linked", "stocks": ["TITAN"],
+                             "signal": tag, "reason": f"Gold {gold['pct']:+.2f}%"})
 
     if natgas and abs(natgas["pct"]) >= 1.0:
         tag = "🟢 Positive" if natgas["pct"] > 0 else "🔴 Negative"
-        impact_rows.append(("Gas Utility (GAIL)", tag, f"Natural Gas {natgas['pct']:+.2f}%"))
+        impact_rows.append({"sector": "Gas Utility", "stocks": ["GAIL"],
+                             "signal": tag, "reason": f"Natural Gas {natgas['pct']:+.2f}%"})
 
     if dxy and abs(dxy["pct"]) >= 0.2:
         tag = "🔴 Negative" if dxy["pct"] > 0 else "🟢 Positive"
-        impact_rows.append(("Broad Nifty / EM Risk Sentiment", tag,
-                             f"DXY {dxy['pct']:+.2f}% — डॉलर की मज़बूती/कमज़ोरी का global risk-appetite पर असर"))
+        impact_rows.append({"sector": "Broad Nifty / EM Risk Sentiment", "stocks": [],
+                             "signal": tag,
+                             "reason": f"DXY {dxy['pct']:+.2f}% — डॉलर की मज़बूती/कमज़ोरी का global risk-appetite पर असर"})
 
     if not impact_rows:
         st.info("आज कोई भी macro driver threshold से ऊपर move नहीं हुआ — कोई स्पष्ट सेक्टर bias नहीं।")
     else:
-        idf = pd.DataFrame(impact_rows, columns=["सेक्टर / स्टॉक", "संकेत", "कारण (Global/India Macro)"])
-        st.dataframe(idf, use_container_width=True, hide_index=True)
+        for row in impact_rows:
+            st.markdown(f"**{row['sector']}** — {row['signal']}")
+            st.caption(row["reason"])
+            if row["stocks"]:
+                links_md = " &nbsp;|&nbsp; ".join(
+                    f"[{s}]({tv_link(tv_symbol_for_stock(s))})" for s in row["stocks"]
+                )
+                st.markdown(links_md, unsafe_allow_html=True)
+            st.markdown("---")
 
 # ---------- TAB: DELIVERY % RISING (3 DAYS) ----------
 with tab_delivery:
@@ -634,7 +768,10 @@ with tab_delivery:
         st.info("आपकी watchlist में अभी कोई स्टॉक लगातार 3 दिन delivery% बढ़ाता नहीं मिला।")
     else:
         rdf = pd.DataFrame(rising)
-        st.dataframe(rdf, use_container_width=True, hide_index=True)
+        st.dataframe(
+            rdf, use_container_width=True, hide_index=True,
+            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+        )
 
 # ---------- TAB: TOP GAINERS / LOSERS ----------
 with tab_movers:
@@ -666,9 +803,9 @@ with tab_movers:
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
 
-# ---------- TAB: IMPORTANT NEWS ----------
+# ---------- TAB: NEWS (Current + Analyst/Important) ----------
 with tab_news:
-    st.subheader("📰 महत्वपूर्ण मार्केट न्यूज़ (24h)")
+    st.subheader("📰 न्यूज़ (सिर्फ़ पिछले 24 घंटे — पूरी तरह Live)")
 
     @st.cache_data(ttl=600, show_spinner=False)
     def fetch_source_news(domain):
@@ -695,6 +832,33 @@ with tab_news:
                 break
         return items
 
+    @st.cache_data(ttl=600, show_spinner=False)
+    def fetch_analyst_news():
+        """Brokerage/analyst target-price/rating type headlines, when:1d only."""
+        if feedparser is None:
+            return []
+        query = urllib.parse.quote_plus(
+            "brokerage OR analyst target price rating Nifty OR Sensex OR stocks India when:1d")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            resp = requests.get(url, timeout=15)
+            feed = feedparser.parse(resp.content)
+        except Exception:
+            return []
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=NEWS_MAX_AGE_HOURS)
+        items = []
+        for e in feed.entries[:15]:
+            pub = e.get("published_parsed")
+            if not pub:
+                continue
+            pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
+            if pub_dt < cutoff:
+                continue
+            items.append({"title": e.title, "link": e.link, "published": pub_dt})
+            if len(items) >= 8:
+                break
+        return items
+
     if feedparser is None:
         st.error("`feedparser` install नहीं है।")
     else:
@@ -702,15 +866,24 @@ with tab_news:
             all_items = []
             for d in NEWS_SOURCES:
                 all_items.extend(fetch_source_news(d))
+            analyst_items = fetch_analyst_news()
+
+        st.markdown("### 🔴 करेंट / ब्रेकिंग न्यूज़ (Latest पहले)")
         if not all_items:
             st.info("पिछले 24 घंटों में कोई नई खबर नहीं मिली।")
         else:
-            for domain in NEWS_SOURCES:
-                d_items = [i for i in all_items if i["domain"] == domain]
-                if not d_items:
-                    continue
-                st.markdown(f"**{domain}**")
-                for it in d_items:
-                    t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
-                    st.markdown(f"- [{it['title']}]({it['link']})  \n  _{t} IST_")
-                st.markdown("---")
+            all_items_sorted = sorted(all_items, key=lambda x: x["published"], reverse=True)
+            for it in all_items_sorted:
+                t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
+                st.markdown(f"- [{it['title']}]({it['link']})  \n  _{it['domain']} · {t} IST_")
+
+        st.markdown("---")
+        st.markdown("### ⭐ महत्वपूर्ण न्यूज़ / टॉप एनालिस्ट स्टेटमेंट")
+        if not analyst_items:
+            st.info("पिछले 24 घंटों में कोई analyst/brokerage headline नहीं मिली।")
+        else:
+            for it in analyst_items:
+                t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
+                st.markdown(f"- [{it['title']}]({it['link']})  \n  _{t} IST_")
+
+        st.caption("सभी headlines Google News की live RSS feed से हैं और 24 घंटे से पुरानी कोई भी खबर filter करके हटा दी जाती है।")
