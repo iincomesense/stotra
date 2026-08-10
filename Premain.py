@@ -18,6 +18,7 @@ Deploy: share.streamlit.io -> connect GitHub repo -> main file: app.py
 
 import concurrent.futures
 import io
+import re
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
@@ -181,7 +182,11 @@ def yf_ticker_for_stock(stock):
 
 # ============================== COLOR HELPERS (Green = Up, Red = Down) ==============================
 def _parse_pct(val):
-    """'+1.23%' / '-0.45%' / 1.23 / -0.45 / '—' सब safely float में parse करता है।"""
+    """
+    कई formats को safely float में parse करता है:
+    '+1.23%' / '-0.45%' / 1.23 / -0.45 / '—' / Dhan-style '7.70 (+1.63%) ▲'
+    (दूसरे केस में parentheses के अंदर वाला % निकाला जाता है)
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -189,7 +194,14 @@ def _parse_pct(val):
     s = str(val).strip()
     if s in ("", "—", "-", "None", "nan"):
         return None
-    s = s.replace("%", "").replace("+", "")
+    # Dhan-style "7.70 (+1.63%) ▲" जैसे strings में parentheses के अंदर % ढूंढो
+    m = re.search(r"\(([-+]?\d+\.?\d*)%\)", s)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            pass
+    s = s.replace("%", "").replace("+", "").replace("▲", "").replace("▼", "").replace("●", "").strip()
     try:
         return float(s)
     except Exception:
@@ -197,7 +209,7 @@ def _parse_pct(val):
 
 
 def pct_bg_style(val):
-    """DataFrame.style.applymap के लिए — पूरे cell को हल्के हरे/लाल background से भरता है।"""
+    """पूरे cell को हल्के हरे/लाल background से भरता है (Styler.map/applymap दोनों के साथ काम करता है)।"""
     v = _parse_pct(val)
     if v is None:
         return ""
@@ -220,17 +232,49 @@ def pct_text_style(val):
     return f"color:{COLOR_FLAT_TEXT};"
 
 
-def style_pct_columns(df, cols, mode="bg"):
+def _styler_apply_map(styler, fn, subset):
     """
-    किसी भी DataFrame में दिए गए % Chg columns पर green/red styling apply करता है।
+    pandas की नई versions में Styler.applymap() हटा दिया गया है (अब Styler.map() है)।
+    यह wrapper दोनों versions पर काम करता है — जो भी method उपलब्ध हो, वही इस्तेमाल होगा।
+    (पिछले वाला AttributeError यहीं से आ रहा था, इसलिए यह fix ज़रूरी था।)
+    """
+    if hasattr(styler, "map"):
+        try:
+            return styler.map(fn, subset=subset)
+        except Exception:
+            pass
+    return styler.applymap(fn, subset=subset)
+
+
+def style_pct_columns(obj, cols, mode="bg"):
+    """
+    obj में DataFrame या pandas Styler दोनों दे सकते हैं (ताकि .format() के साथ chain हो सके)।
+    दिए गए columns पर green(ऊपर)/red(नीचे) styling apply करता है।
     mode="bg"   -> पूरा cell हल्के हरे/लाल background से भरेगा (ज़्यादा visible)
     mode="text" -> सिर्फ अंकों का रंग बदलेगा (compact/dense tables के लिए)
     """
     fn = pct_bg_style if mode == "bg" else pct_text_style
-    valid_cols = [c for c in cols if c in df.columns]
+    if isinstance(obj, pd.DataFrame):
+        styler = obj.style
+        available_cols = obj.columns
+    else:
+        styler = obj
+        available_cols = obj.data.columns
+    valid_cols = [c for c in cols if c in available_cols]
     if not valid_cols:
-        return df.style
-    return df.style.applymap(fn, subset=valid_cols)
+        return styler
+    return _styler_apply_map(styler, fn, valid_cols)
+
+
+def fmt_change(chg, pct):
+    """
+    Dhan app जैसा combined format बनाता है: '7.70 (+1.63%) ▲' / '-3.50 (-1.25%) ▼'
+    chg = absolute price change, pct = % change
+    """
+    if chg is None or pct is None:
+        return "—"
+    arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "●")
+    return f"{chg:+.2f} ({pct:+.2f}%) {arrow}"
 
 
 # ============================== SIDEBAR ==============================
@@ -289,7 +333,8 @@ def batch_daily(tickers_tuple):
             df = data[t].dropna() if len(tickers) > 1 else data.dropna()
             if len(df) >= 2:
                 last, prev = df["Close"].iloc[-1], df["Close"].iloc[-2]
-                out[t] = {"price": last, "pct": (last - prev) / prev * 100}
+                out[t] = {"price": last, "pct": (last - prev) / prev * 100,
+                          "chg": last - prev}
         except Exception:
             continue
     return out
@@ -325,7 +370,7 @@ def get_quotes(tickers):
         if not d:
             continue
         price = intraday.get(t, d["price"])
-        quotes[t] = {"price": price, "pct": d["pct"]}
+        quotes[t] = {"price": price, "pct": d["pct"], "chg": d.get("chg")}
     return quotes
 
 
@@ -586,7 +631,7 @@ with tab_global:
     )
 
     st.markdown("&nbsp;")
-    st.markdown("**हर instrument का Price, % बदलाव और live chart:** &nbsp; 🟢 = ऊपर · 🔴 = नीचे")
+    st.markdown("**हर instrument का Price, बदलाव और live chart:** &nbsp; 🟢▲ = ऊपर · 🔴▼ = नीचे")
     global_yf_tickers = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
     global_quotes = get_quotes(global_yf_tickers)
     ref_rows = []
@@ -595,12 +640,12 @@ with tab_global:
         ref_rows.append({
             "Symbol": sym, "Name": name,
             "Price": f"{q['price']:.2f}" if q else "—",
-            "% Chg": f"{q['pct']:+.2f}%" if q else "—",
+            "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—",
             "Chart": tv_link(tvs),
         })
     ref_df = pd.DataFrame(ref_rows)
     st.dataframe(
-        style_pct_columns(ref_df, ["% Chg"], mode="bg"),
+        style_pct_columns(ref_df, ["Change"], mode="bg"),
         use_container_width=True, hide_index=True,
         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Live Chart खोलें")},
     )
@@ -608,7 +653,7 @@ with tab_global:
 # ---------- TAB: SECTOR INDEX & IMPACT (Watchlist se pehle) ----------
 with tab_sector:
     st.subheader("🏭 सेक्टर इंडेक्स — % बदलाव")
-    st.caption("🟢 = ऊपर · 🔴 = नीचे")
+    st.caption("🟢▲ = ऊपर · 🔴▼ = नीचे")
     sector_yf = list(SECTOR_INDEX_TICKERS.values())
     sector_quotes = get_quotes(sector_yf)
     sec_rows = []
@@ -756,7 +801,7 @@ with tab_stocks:
     flash_badge = "🔴 LIVE (मार्केट खुला — हर 2 मिनट में news check)" if is_market_hours() \
         else "⚪ मार्केट बंद — news हर 30 मिनट में check होगी"
     st.subheader(f"📋 Stock Watchlist ({len(selected_stocks)} स्टॉक्स)")
-    st.caption(flash_badge + " · 🟢 = ऊपर · 🔴 = नीचे")
+    st.caption(flash_badge + " · 🟢▲ = ऊपर · 🔴▼ = नीचे")
 
     yf_tickers = [yf_ticker_for_stock(s) for s in selected_stocks]
     s_quotes = get_quotes(yf_tickers)
@@ -770,13 +815,13 @@ with tab_stocks:
         rows.append({
             "Stock": s,
             "LTP": f"{q['price']:.2f}" if q else "—",
-            "% Chg": f"{q['pct']:+.2f}%" if q else "—",
+            "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—",
             "Chart": tv_link(tv_symbol_for_stock(s)),
             "News (24h)": news_links.get(s),
         })
     sdf = pd.DataFrame(rows)
     st.dataframe(
-        style_pct_columns(sdf, ["% Chg"], mode="bg"),
+        style_pct_columns(sdf, ["Change"], mode="bg"),
         use_container_width=True, hide_index=True, height=460,
         column_config={
             "Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें"),
@@ -1147,34 +1192,37 @@ with tab_delivery:
 # ---------- TAB: TOP GAINERS / LOSERS ----------
 with tab_movers:
     st.subheader("🏆 Top 5 Gainers & Top 5 Losers")
+    st.caption("🟢▲ = ऊपर · 🔴▼ = नीचे")
     yf_tickers = [yf_ticker_for_stock(s) for s in selected_stocks]
     quotes = get_quotes(yf_tickers)
     mv_rows = []
     for s in selected_stocks:
         qd = quotes.get(yf_ticker_for_stock(s))
         if qd:
-            mv_rows.append({"Stock": s, "LTP": qd["price"], "% Chg": qd["pct"],
+            mv_rows.append({"Stock": s, "LTP": qd["price"], "pct": qd["pct"],
+                             "chg": qd.get("chg"),
                              "Chart": tv_link(tv_symbol_for_stock(s))})
     mv_df = pd.DataFrame(mv_rows)
     if mv_df.empty:
         st.info("डेटा लोड हो रहा है, थोड़ी देर में refresh करें।")
     else:
-        gainers = mv_df.sort_values("% Chg", ascending=False).head(5)
-        losers = mv_df.sort_values("% Chg", ascending=True).head(5)
+        gainers = mv_df.sort_values("pct", ascending=False).head(5).copy()
+        losers = mv_df.sort_values("pct", ascending=True).head(5).copy()
+
+        # Dhan-style combined "Change" column बनाकर raw pct/chg कॉलम हटा दो
+        for _df in (gainers, losers):
+            _df["Change"] = _df.apply(lambda r: fmt_change(r["chg"], r["pct"]), axis=1)
+            _df.drop(columns=["pct", "chg"], inplace=True)
 
         st.markdown("#### 🟢 Top 5 Gainers")
         st.dataframe(
-            gainers.style
-                .format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"})
-                .applymap(pct_bg_style, subset=["% Chg"]),
+            style_pct_columns(gainers.style.format({"LTP": "{:.2f}"}), ["Change"], mode="bg"),
             use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
         st.markdown("#### 🔴 Top 5 Losers")
         st.dataframe(
-            losers.style
-                .format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"})
-                .applymap(pct_bg_style, subset=["% Chg"]),
+            style_pct_columns(losers.style.format({"LTP": "{:.2f}"}), ["Change"], mode="bg"),
             use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
