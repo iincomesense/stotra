@@ -8,6 +8,11 @@ link priority) + Nifty Option-OI Outlook | Delivery% (last-close) +
 Bulk/Block Deals | Top Gainers/Losers | Institutional-style News
 (NSE filings + keyword search + sentiment tagging + 1hr expiry).
 
+>>> इस version में बदलाव: हर जगह % Chg कॉलम पर green/red conditional
+>>> color styling जोड़ी गई है — ऊपर (positive) = हरा, नीचे (negative) =
+>>> लाल, 0/flat = सामान्य। यह Global, Sector, Watchlist, Signals,
+>>> Gainers/Losers — सभी टैब्स में एक जैसा (consistent) है।
+
 Deploy: share.streamlit.io -> connect GitHub repo -> main file: app.py
 """
 
@@ -40,6 +45,13 @@ CLEAR_HOUR_IST = 16
 ALERT_CLEAR_HOUR_IST = 20
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
+
+# ============================== COLOR THEME (Green/Red) ==============================
+COLOR_POS_BG = "#d4f8d4"      # हल्का हरा background
+COLOR_POS_TEXT = "#0a7d2f"    # गहरा हरा text
+COLOR_NEG_BG = "#f8d4d4"      # हल्का लाल background
+COLOR_NEG_TEXT = "#c0392b"    # गहरा लाल text
+COLOR_FLAT_TEXT = "#555555"   # 0% / flat के लिए ग्रे
 
 # ============================== MASTER STOCK LIST ==============================
 RAW_STOCKS = """TCS,M&M,HCLTECH,SBIN,INFY,HINDUNILVR,RELIANCE,BHARTIARTL,BEL,ONGC,
@@ -165,6 +177,60 @@ def tv_symbol_for_stock(stock):
 
 def yf_ticker_for_stock(stock):
     return f"{YF_FIX.get(stock, stock)}.NS"
+
+
+# ============================== COLOR HELPERS (Green = Up, Red = Down) ==============================
+def _parse_pct(val):
+    """'+1.23%' / '-0.45%' / 1.23 / -0.45 / '—' सब safely float में parse करता है।"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if s in ("", "—", "-", "None", "nan"):
+        return None
+    s = s.replace("%", "").replace("+", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def pct_bg_style(val):
+    """DataFrame.style.applymap के लिए — पूरे cell को हल्के हरे/लाल background से भरता है।"""
+    v = _parse_pct(val)
+    if v is None:
+        return ""
+    if v > 0:
+        return f"background-color:{COLOR_POS_BG}; color:{COLOR_POS_TEXT}; font-weight:600;"
+    if v < 0:
+        return f"background-color:{COLOR_NEG_BG}; color:{COLOR_NEG_TEXT}; font-weight:600;"
+    return f"color:{COLOR_FLAT_TEXT};"
+
+
+def pct_text_style(val):
+    """सिर्फ text color (बिना background) — घने table रो के लिए हल्का लुक चाहिए तो इसे इस्तेमाल करें।"""
+    v = _parse_pct(val)
+    if v is None:
+        return ""
+    if v > 0:
+        return f"color:{COLOR_POS_TEXT}; font-weight:700;"
+    if v < 0:
+        return f"color:{COLOR_NEG_TEXT}; font-weight:700;"
+    return f"color:{COLOR_FLAT_TEXT};"
+
+
+def style_pct_columns(df, cols, mode="bg"):
+    """
+    किसी भी DataFrame में दिए गए % Chg columns पर green/red styling apply करता है।
+    mode="bg"   -> पूरा cell हल्के हरे/लाल background से भरेगा (ज़्यादा visible)
+    mode="text" -> सिर्फ अंकों का रंग बदलेगा (compact/dense tables के लिए)
+    """
+    fn = pct_bg_style if mode == "bg" else pct_text_style
+    valid_cols = [c for c in cols if c in df.columns]
+    if not valid_cols:
+        return df.style
+    return df.style.applymap(fn, subset=valid_cols)
 
 
 # ============================== SIDEBAR ==============================
@@ -520,7 +586,7 @@ with tab_global:
     )
 
     st.markdown("&nbsp;")
-    st.markdown("**हर instrument का Price, % बदलाव और live chart:**")
+    st.markdown("**हर instrument का Price, % बदलाव और live chart:** &nbsp; 🟢 = ऊपर · 🔴 = नीचे")
     global_yf_tickers = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
     global_quotes = get_quotes(global_yf_tickers)
     ref_rows = []
@@ -532,14 +598,17 @@ with tab_global:
             "% Chg": f"{q['pct']:+.2f}%" if q else "—",
             "Chart": tv_link(tvs),
         })
+    ref_df = pd.DataFrame(ref_rows)
     st.dataframe(
-        pd.DataFrame(ref_rows), use_container_width=True, hide_index=True,
+        style_pct_columns(ref_df, ["% Chg"], mode="bg"),
+        use_container_width=True, hide_index=True,
         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Live Chart खोलें")},
     )
 
 # ---------- TAB: SECTOR INDEX & IMPACT (Watchlist se pehle) ----------
 with tab_sector:
     st.subheader("🏭 सेक्टर इंडेक्स — % बदलाव")
+    st.caption("🟢 = ऊपर · 🔴 = नीचे")
     sector_yf = list(SECTOR_INDEX_TICKERS.values())
     sector_quotes = get_quotes(sector_yf)
     sec_rows = []
@@ -551,14 +620,10 @@ with tab_sector:
         })
     sec_df = pd.DataFrame(sec_rows)
     if not sec_df.empty:
-        def sec_color(row):
-            try:
-                v = float(row["% Chg"].replace("%", "").replace("+", ""))
-            except Exception:
-                return [""] * len(row)
-            c = "background-color:#d4f8d4" if v > 0 else ("background-color:#f8d4d4" if v < 0 else "")
-            return [c] * len(row)
-        st.dataframe(sec_df.style.apply(sec_color, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(
+            style_pct_columns(sec_df, ["% Chg"], mode="bg"),
+            use_container_width=True, hide_index=True,
+        )
     st.caption("नोट: कुछ सेक्टर इंडेक्स टिकर Yahoo Finance पर उपलब्ध ना हों तो वहां '—' दिखेगा।")
 
     st.markdown("---")
@@ -691,7 +756,7 @@ with tab_stocks:
     flash_badge = "🔴 LIVE (मार्केट खुला — हर 2 मिनट में news check)" if is_market_hours() \
         else "⚪ मार्केट बंद — news हर 30 मिनट में check होगी"
     st.subheader(f"📋 Stock Watchlist ({len(selected_stocks)} स्टॉक्स)")
-    st.caption(flash_badge)
+    st.caption(flash_badge + " · 🟢 = ऊपर · 🔴 = नीचे")
 
     yf_tickers = [yf_ticker_for_stock(s) for s in selected_stocks]
     s_quotes = get_quotes(yf_tickers)
@@ -711,7 +776,8 @@ with tab_stocks:
         })
     sdf = pd.DataFrame(rows)
     st.dataframe(
-        sdf, use_container_width=True, hide_index=True, height=460,
+        style_pct_columns(sdf, ["% Chg"], mode="bg"),
+        use_container_width=True, hide_index=True, height=460,
         column_config={
             "Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें"),
             "News (24h)": st.column_config.LinkColumn("News (24h)", display_text="📰 पढ़ें"),
@@ -814,7 +880,8 @@ def check_volume_spike(df, mult):
 
 with tab_signals:
     st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
-    st.caption("⭐⭐ = EMA Cross और Volume Spike दोनों एक साथ (मज़बूत सिग्नल) · ⭐ = सिर्फ एक सिग्नल · हर नया सिग्नल 🔔 Alerts टैब में भी जुड़ जाता है (रात 8 बजे auto-clear)")
+    st.caption("⭐⭐ = EMA Cross और Volume Spike दोनों एक साथ (मज़बूत सिग्नल) · ⭐ = सिर्फ एक सिग्नल · "
+               "🟢 पूरी रो = EMA UP · 🔴 पूरी रो = EMA DOWN · हर नया सिग्नल 🔔 Alerts टैब में भी जुड़ जाता है (रात 8 बजे auto-clear)")
 
     local_tf = st.multiselect(
         "टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()),
@@ -875,9 +942,10 @@ with tab_signals:
         sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
 
         def hl(row):
+            # पूरी row EMA UP/DOWN के आधार पर हरी/लाल — दोनों signal साथ हों तो हल्का बैंगनी highlight
             base = "background-color:#e8d4f8" if row["सिग्नल"] == "⭐⭐" else (
-                "background-color:#d4f8d4" if "UP" in row["टाइप"] else
-                "background-color:#f8d4d4" if "DOWN" in row["टाइप"] else
+                f"background-color:{COLOR_POS_BG}" if "UP" in row["टाइप"] else
+                f"background-color:{COLOR_NEG_BG}" if "DOWN" in row["टाइप"] else
                 "background-color:#fff2cc")
             return [base] * len(row)
 
@@ -890,7 +958,8 @@ with tab_signals:
 with tab_alerts:
     st.subheader("🔔 Signal Alerts / Notifications")
     st.caption(f"यहां सभी EMA Cross और Volume Spike अलर्ट symbol + time के साथ जमा होते हैं। "
-               f"रोज़ रात {ALERT_CLEAR_HOUR_IST}:00 बजे यह लिस्ट अपने-आप खाली हो जाती है।")
+               f"रोज़ रात {ALERT_CLEAR_HOUR_IST}:00 बजे यह लिस्ट अपने-आप खाली हो जाती है। "
+               f"🟢 = EMA UP · 🔴 = EMA DOWN")
 
     alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
     st.metric("कुल Active Alerts", len(alerts))
@@ -900,8 +969,15 @@ with tab_alerts:
     else:
         adf = pd.DataFrame(alerts)[["stars", "stock", "tf", "type", "time", "logged_at", "chart"]]
         adf.columns = ["सिग्नल", "स्टॉक", "टाइमफ्रेम", "टाइप", "बार टाइम", "Alert मिला", "Chart"]
+
+        def hl_alert(row):
+            base = (f"background-color:{COLOR_POS_BG}" if "UP" in row["टाइप"] else
+                    f"background-color:{COLOR_NEG_BG}" if "DOWN" in row["टाइप"] else
+                    "background-color:#fff2cc")
+            return [base] * len(row)
+
         st.dataframe(
-            adf, use_container_width=True, hide_index=True,
+            adf.style.apply(hl_alert, axis=1), use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
         )
         if st.button("🗑️ सभी Alerts अभी साफ करें"):
@@ -1085,15 +1161,20 @@ with tab_movers:
     else:
         gainers = mv_df.sort_values("% Chg", ascending=False).head(5)
         losers = mv_df.sort_values("% Chg", ascending=True).head(5)
+
         st.markdown("#### 🟢 Top 5 Gainers")
         st.dataframe(
-            gainers.style.format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"}),
+            gainers.style
+                .format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"})
+                .applymap(pct_bg_style, subset=["% Chg"]),
             use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
         st.markdown("#### 🔴 Top 5 Losers")
         st.dataframe(
-            losers.style.format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"}),
+            losers.style
+                .format({"LTP": "{:.2f}", "% Chg": "{:+.2f}%"})
+                .applymap(pct_bg_style, subset=["% Chg"]),
             use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
