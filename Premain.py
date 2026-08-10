@@ -143,20 +143,221 @@ NSE_HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-# ============================== PAGE SETUP (mobile friendly) ==============================
+# ============================== PAGE SETUP (Dhan/Upstox-style theme) ==============================
 st.set_page_config(page_title="Full Market Dashboard", layout="wide",
                     page_icon="📈", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --dh-bg:        #F5F7FA;
+  --dh-card:      #FFFFFF;
+  --dh-border:    #E6E9F0;
+  --dh-text:      #14151A;
+  --dh-muted:     #70758A;
+  --dh-navy:      #0B1F3A;
+  --dh-navy-soft: #16294A;
+  --dh-accent:    #00C896;
+  --dh-green:     #0FAE6E;
+  --dh-green-bg:  #E7F8F0;
+  --dh-red:       #E4463F;
+  --dh-red-bg:    #FDEBEA;
+  --dh-flat-bg:   #F0F1F5;
+}
+
+html, body, [class^="css"], [class*=" css"] {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+}
+
+/* ---------- ऐप background हमेशा हल्का (light) रहे, चाहे फ़ोन dark mode में हो ---------- */
+[data-testid="stAppViewContainer"], [data-testid="stHeader"], .main, section.main {
+  background: var(--dh-bg) !important;
+}
+[data-testid="stHeader"] { background: transparent !important; }
+
+h1, h2, h3, h4 { color: var(--dh-text) !important; font-weight: 700 !important; letter-spacing: -0.01em; }
+[data-testid="stCaptionContainer"] { color: var(--dh-muted) !important; font-size: 12.5px !important; }
+
 @media (max-width: 768px) {
     .block-container {padding-left: 0.6rem; padding-right: 0.6rem; padding-top: 1rem;}
     div[data-testid="stMetricValue"] {font-size: 1.1rem;}
     h1 {font-size: 1.4rem !important;}
     h2, h3 {font-size: 1.1rem !important;}
 }
+
+/* ---------- Tabs -> गोल pill navigation (Dhan/Upstox जैसा) ---------- */
+div[data-testid="stTabs"] div[role="tablist"], .stTabs [data-baseweb="tab-list"] {
+  gap: 4px !important; background: var(--dh-card) !important; padding: 6px !important;
+  border-radius: 14px !important; border: 1px solid var(--dh-border) !important;
+  overflow-x: auto;
+}
+div[data-testid="stTabs"] button[role="tab"], .stTabs [data-baseweb="tab"] {
+  border-radius: 10px !important; padding: 9px 16px !important; font-weight: 600 !important;
+  font-size: 13.5px !important; color: var(--dh-muted) !important; background: transparent !important;
+}
+div[data-testid="stTabs"] button[aria-selected="true"], .stTabs [aria-selected="true"] {
+  background: var(--dh-navy) !important; color: #FFFFFF !important;
+}
+div[data-testid="stTabs"] [data-baseweb="tab-highlight"],
+div[data-testid="stTabs"] [data-baseweb="tab-border"] { display: none !important; }
+
+/* ---------- Dataframes, metrics, alerts -> rounded cards ---------- */
+[data-testid="stDataFrame"] {
+  border-radius: 12px !important; overflow: hidden; border: 1px solid var(--dh-border) !important;
+}
+div[data-testid="stMetric"] {
+  background: var(--dh-card); border: 1px solid var(--dh-border); border-radius: 12px; padding: 14px 16px;
+}
+div[data-testid="stMetricValue"] { color: var(--dh-text) !important; font-weight: 800 !important; }
+div[data-testid="stMetricLabel"] { color: var(--dh-muted) !important; }
+[data-testid="stAlert"] { border-radius: 12px !important; }
+
+/* ---------- Custom Top Bar (brand + Nifty/Sensex chips) ---------- */
+.dh-topbar {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  background: linear-gradient(135deg, var(--dh-navy), var(--dh-navy-soft));
+  border-radius: 16px; padding: 16px 20px; margin-bottom: 18px;
+}
+.dh-brand { display: flex; align-items: center; gap: 10px; }
+.dh-brand-logo {
+  width: 38px; height: 38px; border-radius: 11px; background: var(--dh-accent);
+  display: flex; align-items: center; justify-content: center; font-weight: 800; color: var(--dh-navy);
+  font-size: 18px;
+}
+.dh-brand-text { font-weight: 800; font-size: 17px; color: #fff; letter-spacing: -0.02em; line-height: 1.1; }
+.dh-brand-sub { font-size: 11px; color: #AEB6C9; font-weight: 500; margin-top: 2px; }
+.dh-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #C7CEDD; font-weight: 600; }
+.dh-status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dh-chip-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.dh-chip {
+  background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 11px; padding: 8px 14px; min-width: 118px;
+}
+.dh-chip-label { font-size: 10.5px; color: #9AA4BC; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.dh-chip-value { font-size: 14.5px; font-weight: 800; color: #fff; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.dh-chip-change { font-size: 12px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.dh-chip-change.up   { color: #5CF2C1; }
+.dh-chip-change.down { color: #FF8A85; }
+.dh-chip-change.flat { color: #9AA4BC; }
+
+/* ---------- Stock Row Cards (Dhan/Upstox list style) ---------- */
+.dh-card { background: var(--dh-card); border: 1px solid var(--dh-border); border-radius: 14px;
+  overflow: hidden; margin-bottom: 16px; }
+.dh-card-title { padding: 14px 16px 10px 16px; font-weight: 700; font-size: 14px;
+  color: var(--dh-text); border-bottom: 1px solid var(--dh-border); }
+.dh-row { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 13px 16px; border-top: 1px solid var(--dh-border); }
+.dh-row:first-of-type { border-top: none; }
+.dh-row-left { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dh-row-name { font-weight: 700; font-size: 14.5px; color: var(--dh-text); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.dh-row-sub { font-size: 11px; color: var(--dh-muted); font-weight: 600; letter-spacing: .02em; }
+.dh-row-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.dh-row-prices { text-align: right; }
+.dh-row-price { font-weight: 700; font-size: 14.5px; color: var(--dh-text); font-variant-numeric: tabular-nums; }
+.dh-row-change { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 3px;
+  display: inline-block; padding: 2px 8px; border-radius: 6px; white-space: nowrap; }
+.dh-row-change.up   { color: var(--dh-green); background: var(--dh-green-bg); }
+.dh-row-change.down { color: var(--dh-red);   background: var(--dh-red-bg); }
+.dh-row-change.flat { color: var(--dh-muted); background: var(--dh-flat-bg); }
+.dh-row-actions { display: flex; gap: 6px; }
+.dh-icon-btn { width: 30px; height: 30px; border-radius: 8px; background: #F0F2F7;
+  display: flex; align-items: center; justify-content: center; text-decoration: none;
+  font-size: 13.5px; flex-shrink: 0; }
+.dh-icon-btn:hover { background: #E4E8F0; }
+.dh-icon-btn.disabled { opacity: 0.35; pointer-events: none; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ============================== DHAN/UPSTOX-STYLE ROW-CARD HELPERS ==============================
+def _cls_for_pct(pct):
+    if pct is None:
+        return "flat"
+    if pct > 0:
+        return "up"
+    if pct < 0:
+        return "down"
+    return "flat"
+
+
+def stock_row_html(name, sub, price_str, change_str, pct_for_color, chart_url=None, news_url=None):
+    """एक स्टॉक/instrument की Dhan-style row (नाम बाईं ओर, price+change दाईं ओर, icons)।"""
+    cls = _cls_for_pct(pct_for_color)
+    chart_btn = (f'<a class="dh-icon-btn" href="{chart_url}" target="_blank" title="Chart खोलें">📈</a>'
+                 if chart_url else '<span class="dh-icon-btn disabled">📈</span>')
+    news_html = ""
+    if news_url is not None:
+        news_btn = (f'<a class="dh-icon-btn" href="{news_url}" target="_blank" title="News पढ़ें">📰</a>'
+                    if news_url else '<span class="dh-icon-btn disabled">📰</span>')
+        news_html = news_btn
+    price_html = f'<div class="dh-row-price">{price_str}</div>' if price_str else ""
+    return f"""
+    <div class="dh-row">
+      <div class="dh-row-left">
+        <div class="dh-row-name">{name}</div>
+        <div class="dh-row-sub">{sub}</div>
+      </div>
+      <div class="dh-row-right">
+        <div class="dh-row-prices">
+          {price_html}
+          <div class="dh-row-change {cls}">{change_str}</div>
+        </div>
+        <div class="dh-row-actions">{news_html}{chart_btn}</div>
+      </div>
+    </div>
+    """
+
+
+def render_row_card(title, rows_html):
+    """कई rows को एक सफ़ेद कार्ड में जोड़कर एक ही st.markdown कॉल में render करता है।"""
+    title_html = f'<div class="dh-card-title">{title}</div>' if title else ""
+    st.markdown(f'<div class="dh-card">{title_html}{"".join(rows_html)}</div>', unsafe_allow_html=True)
+
+
+def top_bar():
+    """नेवी टॉप बार — brand + Nifty/Sensex live chips (Dhan/Upstox के होम-स्क्रीन जैसा)।"""
+    idx_quotes = get_quotes(["^NSEI", "^BSESN"])
+    nifty = idx_quotes.get("^NSEI")
+    sensex = idx_quotes.get("^BSESN")
+
+    def chip(label, q):
+        if not q:
+            return f'<div class="dh-chip"><div class="dh-chip-label">{label}</div><div class="dh-chip-value">—</div></div>'
+        cls = _cls_for_pct(q["pct"])
+        arrow = "▲" if cls == "up" else ("▼" if cls == "down" else "●")
+        return f"""<div class="dh-chip">
+            <div class="dh-chip-label">{label}</div>
+            <div class="dh-chip-value">{q['price']:.2f}</div>
+            <div class="dh-chip-change {cls}">{q['pct']:+.2f}% {arrow}</div>
+        </div>"""
+
+    status_color = "#5CF2C1" if is_market_hours() else "#FF8A85"
+    status_text = "मार्केट खुला" if is_market_hours() else "मार्केट बंद"
+
+    st.markdown(f"""
+    <div class="dh-topbar">
+      <div>
+        <div class="dh-brand">
+          <div class="dh-brand-logo">📈</div>
+          <div>
+            <div class="dh-brand-text">Full Market Dashboard</div>
+            <div class="dh-brand-sub">Pre-market + Intraday · {now_ist().strftime('%d-%b-%Y')}</div>
+          </div>
+        </div>
+        <div class="dh-status" style="margin-top:10px;">
+          <span class="dh-status-dot" style="background:{status_color};"></span>{status_text} ·
+          {now_ist().strftime('%H:%M:%S')} IST
+        </div>
+      </div>
+      <div class="dh-chip-row">
+        {chip("NIFTY 50", nifty)}
+        {chip("SENSEX", sensex)}
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 def now_ist():
