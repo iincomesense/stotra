@@ -848,10 +848,7 @@ def check_volume_spike(df, mult):
 with tab_signals:
     st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
     st.caption(
-        "🔥 = Daily टाइमफ्रेम पर Volume Spike (सबसे मज़बूत सिग्नल, अलग हाइलाइट) · "
-        "⭐⭐ = EMA Cross + Volume Spike साथ · ⭐ = सिर्फ एक सिग्नल · "
-        "🟢/🔴 पूरी रो = EMA UP/DOWN · हर नया सिग्नल 🔔 Alerts टैब में भी जुड़ता है (रात 8 बजे auto-clear)"
-    )
+        "")
 
     local_tf = st.multiselect("टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()), default=signal_timeframes, key="signals_tf_local")
     is_after_close = now_ist().hour >= 16
@@ -1115,9 +1112,8 @@ with tab_movers:
 
 # ---------- TAB: NEWS (सुबह 8:30 - रात 8:30 विंडो) ----------
 with tab_news:
-    st.subheader("📰 News (सुबह 8:30 – रात 8:30 · Institutional-style)")
-    st.caption("🏦 पहले NSE Direct Corporate Filings, फिर टारगेटेड कीवर्ड सर्च — हर खबर पर sentiment टैग। "
-               "रात 8:30 के बाद यह टैब अपने-आप खाली हो जाता है और सुबह 8:30 से फिर शुरू होता है।")
+    st.subheader("📰 News (Market)")
+    st.caption("🏦")
 
     if not news_window_active():
         st.info("⏰ अभी News विंडो (8:30 AM – 8:30 PM) के बाहर है — कल सुबह 8:30 बजे फिर से news दिखेगी।")
