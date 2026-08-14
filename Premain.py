@@ -1135,58 +1135,258 @@ with tab_movers:
             use_container_width=True, hide_index=True,
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
+      
 
-# ---------- TAB 10: NEWS ----------
+# ============================== TAB 10: AI INTELLIGENCE ENGINE (HIGH-CONVICTION TRADES) ==============================
 with tab_news:
-    if not news_window_active():
-        st.info("⏰ अभी News विंडो (8:30 AM – 8:30 PM) के बाहर है — कल सुबह 8:30 बजे फिर से news दिखेगी।")
+    st.subheader("🧠 Real-Time AI Market Intelligence Engine")
+    st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Direct NSE Filings + Technical Confluence का लाइव सिंथेसिस")
+
+    # ------------------ 1. DATA GATHERING & SYNTHESIS ------------------
+    with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा (Filings, Technicals, OI, Macro) एनालाइज कर रहा है..."):
+        
+        # A. Live Quotes & Technicals
+        stock_yf_tickers = [yf_ticker_for_stock(s) for s in selected_stocks]
+        live_quotes = get_quotes(stock_yf_tickers)
+        
+        # B. Technical Scan Data (Daily + 1 Hour)
+        scan_items = [(s, yf_ticker_for_stock(s), tv_symbol_for_stock(s), "🇮🇳 Stock") for s in selected_stocks]
+        tf_scan_results = fetch_all_tf_data_fast_v2(("Daily", "1 Hour"), tuple(scan_items))
+        
+        # C. Corporate Filings (NSE Direct)
+        corporate_filings = fetch_nse_corporate_announcements()
+        filings_by_stock = {}
+        if corporate_filings:
+            for f in corporate_filings:
+                sym = f.get("symbol")
+                if sym in selected_stocks:
+                    filings_by_stock.setdefault(sym, []).append(f.get("subject", ""))
+        
+        # D. Macro Environment Synthesis
+        macro_quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
+        usdinr_data = macro_quotes.get("INR=X")
+        crude_data = macro_quotes.get("CL=F")
+        us10y_data = macro_quotes.get("^TNX")
+        
+        # Macro Sentiment Bias
+        crude_pct = crude_data.get("pct", 0) if crude_data else 0
+        usdinr_pct = usdinr_data.get("pct", 0) if usdinr_data else 0
+        
+        # E. FII / DII Flow Bias
+        fii_df, _ = fetch_fii_dii()
+        fii_bullish = False
+        fii_bearish = False
+        if fii_df is not None and not fii_df.empty:
+            try:
+                net_col = [c for c in fii_df.columns if "net" in c.lower()][0]
+                cat_col = [c for c in fii_df.columns if "cat" in c.lower()][0]
+                for _, r in fii_df.iterrows():
+                    if "FII" in str(r[cat_col]).upper():
+                        val = float(r[net_col])
+                        if val > 500: fii_bullish = True
+                        elif val < -500: fii_bearish = True
+            except Exception:
+                pass
+
+        # F. Nifty Option Chain Bias
+        oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+        pcr_value = 1.0
+        if oc_data:
+            try:
+                records = oc_data["records"]["data"]
+                tot_c = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
+                tot_p = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
+                if tot_c > 0: pcr_value = round(tot_p / tot_c, 2)
+            except Exception:
+                pass
+
+    # ------------------ 2. HIGH-CONVICTION TRADE ENGINE LOGIC ------------------
+    high_conviction_trades = []
+
+    for stock in selected_stocks:
+        yf_t = yf_ticker_for_stock(stock)
+        q = live_quotes.get(yf_t)
+        if not q or q.get("price") is None:
+            continue
+            
+        ltp = q["price"]
+        chg_pct = q.get("pct", 0)
+        
+        # Signals & Indicators Check
+        daily_data = tf_scan_results.get("Daily", {}).get(stock, {})
+        h1_data = tf_scan_results.get("1 Hour", {}).get(stock, {})
+        
+        reasons_long = []
+        reasons_short = []
+        score_long = 0
+        score_short = 0
+
+        # --- Rule 1: Technical Price/Volume Signals ---
+        if daily_data and "df" in daily_data:
+            df_d = daily_data["df"]
+            vol_spike = check_volume_spike(df_d, mult=1.8)
+            ema_cross = check_ema_cross(df_d)
+            rsi_stat = check_rsi(df_d)
+
+            if vol_spike:
+                if chg_pct > 1.0:
+                    reasons_long.append(f"Heavy Volume Expansion ({vol_spike}) + Daily Momentum")
+                    score_long += 2
+                elif chg_pct < -1.0:
+                    reasons_short.append(f"High-Volume Breakdown ({vol_spike})")
+                    score_short += 2
+
+            if ema_cross == "🟢 EMA UP":
+                reasons_long.append("Daily EMA 20/50 Golden Cross Signal")
+                score_long += 2
+            elif ema_cross == "🔴 EMA DOWN":
+                reasons_short.append("Daily EMA 20/50 Death Cross Signal")
+                score_short += 2
+
+            if rsi_stat and "OS" in rsi_stat:
+                reasons_long.append("Daily RSI Oversold Boundary (Mean Reversion Opportunity)")
+                score_long += 1
+            elif rsi_stat and "OB" in rsi_stat:
+                reasons_short.append("Daily RSI Overbought Exhaustion Zone")
+                score_short += 1
+
+        # --- Rule 2: NSE Direct Corporate Filings (Catalysts) ---
+        stock_filings = filings_by_stock.get(stock, [])
+        for headline in stock_filings:
+            h_lower = headline.lower()
+            if any(w in h_lower for w in ["order", "contract", "approval", "acquisition", "expansion", "profit", "beats"]):
+                reasons_long.append(f"Catalyst Event: {headline[:80]}...")
+                score_long += 3
+            elif any(w in h_lower for w in ["resignation", "investigation", "loss", "penalty", "default", "dispute"]):
+                reasons_short.append(f"Negative Catalyst: {headline[:80]}...")
+                score_short += 3
+
+        # --- Rule 3: Macro Alignment ---
+        # Oil / OMC Sector Dynamics
+        if stock in ["BPCL", "IOC", "HINDPETRO", "INDIGO", "ASIANPAINT"]:
+            if crude_pct <= -1.5:
+                reasons_long.append(f"Macro Tailwind: Crude Oil Down {crude_pct:.2f}% (Margin Expansion)")
+                score_long += 2
+            elif crude_pct >= 1.5:
+                reasons_short.append(f"Macro Headwind: Crude Oil Spiked {crude_pct:+.2f}% (Input Cost Pressure)")
+                score_short += 2
+
+        if stock in ["ONGC", "OIL"] and crude_pct >= 1.5:
+            reasons_long.append(f"Macro Tailwind: Crude Realization Up ({crude_pct:+.2f}%)")
+            score_long += 2
+
+        # IT Sector vs USDINR
+        if stock in ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "PERSISTENT"]:
+            if usdinr_pct >= 0.2:
+                reasons_long.append(f"FX Advantage: Rupee Weakened ({usdinr_pct:+.2f}%)")
+                score_long += 1.5
+
+        # --- Rule 4: Institutional Flow & Option Market Bias ---
+        if fii_bullish and pcr_value > 1.0:
+            reasons_long.append(f"Institutional Confluence: FII Net Buyers + Market PCR Bullish ({pcr_value})")
+            score_long += 1.5
+        elif fii_bearish and pcr_value < 0.8:
+            reasons_short.append(f"Institutional Confluence: FII Net Sellers + Market PCR Bearish ({pcr_value})")
+            score_short += 1.5
+
+        # ------------------ SELECTION FILTER ------------------
+        # Minimum score threshold to qualify as a High-Conviction Trade
+        if score_long >= 3.5 and score_long > score_short:
+            high_conviction_trades.append({
+                "symbol": stock,
+                "direction": "LONG 🟢",
+                "ltp": ltp,
+                "chg": chg_pct,
+                "conviction": "HIGH" if score_long >= 5.5 else "MEDIUM-HIGH",
+                "reasons": reasons_long,
+                "target_est": round(ltp * 1.035, 2),  # Tentative Swing Target (+3.5%)
+                "stop_loss": round(ltp * 0.985, 2),   # Tentative Risk Level (-1.5%)
+                "chart_link": tv_link(tv_symbol_for_stock(stock)),
+            })
+        elif score_short >= 3.5 and score_short > score_long:
+            high_conviction_trades.append({
+                "symbol": stock,
+                "direction": "SHORT 🔴",
+                "ltp": ltp,
+                "chg": chg_pct,
+                "conviction": "HIGH" if score_short >= 5.5 else "MEDIUM-HIGH",
+                "reasons": reasons_short,
+                "target_est": round(ltp * 0.965, 2),  # Tentative Short Target (-3.5%)
+                "stop_loss": round(ltp * 1.015, 2),   # Tentative Stop Loss (+1.5%)
+                "chart_link": tv_link(tv_symbol_for_stock(stock)),
+            })
+
+    # ------------------ 3. DISPLAY AI HIGH-CONVICTION CARDS ------------------
+    if not high_conviction_trades:
+        st.info("ℹ️ **AI Analysis:** वर्तमान बाज़ार स्थिति में आपकी Watchlist में कोई मल्टी-फैक्टर Alignment वाला Trade Opportunity नहीं बना है। बाजार Range-bound है या Catalyst / Signal की कमी है।")
     else:
-        st.markdown("### 🏦 Direct Exchange Filings (NSE Corporate Announcements)")
-        filings = fetch_nse_corporate_announcements()
-        watch_set = set(selected_stocks)
-        relevant_filings = [f for f in filings if f["symbol"] in watch_set]
-        if relevant_filings:
-            for f in relevant_filings[:15]:
-                link = f["attachment"] or "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
-                st.markdown(f"- **{f['symbol']}** — [{f['subject']}]({link})  \n  _{f['time']}_")
-        else:
-            st.info("आपकी watchlist से जुड़ी कोई ताज़ा corporate filing अभी नहीं मिली।")
+        st.success(f"🔥 **AI Alert:** {len(high_conviction_trades)} High-Conviction / Multi-Context Trade Setup की पहचान हुई है!")
+        
+        # Display each setup in structured cards
+        for trade in high_conviction_trades:
+            card_color = "#e6f4ea" if "LONG" in trade["direction"] else "#fce8e6"
+            border_color = "#34a853" if "LONG" in trade["direction"] else "#ea4335"
+            
+            with st.container():
+                st.markdown(
+                    f"""
+                    <div style="background-color: {card_color}; border-left: 6px solid {border_color}; padding: 16px; border-radius: 8px; margin-bottom: 15px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3 style="margin: 0; color: #14151A;">
+                                {trade['symbol']} — <span style="color: {'#0a7d2f' if 'LONG' in trade['direction'] else '#c0392b'};">{trade['direction']}</span>
+                            </h3>
+                            <span style="background-color: #ffffff; padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 13px; border: 1px solid #ccc;">
+                                Conviction: {trade['conviction']}
+                            </span>
+                        </div>
+                        <p style="margin: 8px 0 12px 0; font-weight: 600;">
+                            LTP: ₹{trade['ltp']:.2f} ({trade['chg']:+.2f}%) &nbsp;|&nbsp; 
+                            🎯 Target Range: ₹{trade['target_est']} &nbsp;|&nbsp; 
+                            🛑 Invalidating Level (SL): ₹{trade['stop_loss']}
+                        </p>
+                        <div style="background: #ffffff; padding: 10px; border-radius: 6px; font-size: 13.5px;">
+                            <strong>📌 Dynamic Trade Rationale (Synthesized Drivers):</strong>
+                            <ul style="margin: 5px 0 0 20px; padding: 0;">
+                                {"".join([f"<li>{r}</li>" for r in trade['reasons']])}
+                            </ul>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                st.markdown(f"📈 **[Open TradingView Advanced Chart]({trade['chart_link']})**")
+                st.markdown("---")
+
+    # ------------------ 4. RAW CORPORATE FILINGS & NEWS STREAM ------------------
+    with st.expander("📄 Direct Exchange Filings & Keyword News Stream (Raw Data Window)"):
+        st.markdown("#### 🏦 Corporate Announcements (NSE Direct)")
+        if corporate_filings:
+            relevant_filings = [f for f in corporate_filings if f["symbol"] in set(selected_stocks)]
+            if relevant_filings:
+                for f in relevant_filings[:10]:
+                    link = f.get("attachment") or "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+                    st.markdown(f"- **{f['symbol']}** — [{f['subject']}]({link}) _{f.get('time', '')}_")
+            else:
+                st.write("Watchlist स्टॉक्स से जुड़ी कोई नई filing नहीं है।")
 
         st.markdown("---")
+        st.markdown("#### 🎯 Macro & Market News (Targeted)")
+        if feedparser is not None and news_window_active():
+            @st.cache_data(ttl=300, show_spinner=False)
+            def fetch_keyword_news_fast(keyword):
+                query = urllib.parse.quote_plus(f"{keyword} when:1d")
+                url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+                try:
+                    feed = feedparser.parse(requests.get(url, timeout=10).content)
+                    return feed.entries[:5]
+                except Exception:
+                    return []
 
-        @st.cache_data(ttl=300, show_spinner=False)
-        def fetch_keyword_news(keyword):
-            if feedparser is None:
-                return []
-            query = urllib.parse.quote_plus(f"{keyword} when:1d")
-            url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-            try:
-                feed = feedparser.parse(requests.get(url, timeout=15).content)
-            except Exception:
-                return []
-            cutoff = news_cutoff_utc()
-            items = []
-            for e in feed.entries[:10]:
-                pub = e.get("published_parsed")
-                if pub:
-                    pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
-                    if pub_dt >= cutoff:
-                        items.append({"title": e.title, "link": e.link, "published": pub_dt, "keyword": keyword})
-            return items
+            news_items = []
+            for kw in NEWS_KEYWORDS[:5]:
+                for e in fetch_keyword_news_fast(kw):
+                    news_items.append((e.title, e.link))
+            
+            for title, link in news_items[:15]:
+                st.markdown(f"- {tag_news(title)} — [{title}]({link})")
 
-        if feedparser is not None:
-            st.markdown("### 🎯 टारगेटेड मार्केट-मूविंग न्यूज़ (सुबह 8:30 से अब तक)")
-            all_items = []
-            for kw in NEWS_KEYWORDS:
-                all_items.extend(fetch_keyword_news(kw))
-            seen, dedup_items = set(), []
-            for it in all_items:
-                if it["link"] not in seen:
-                    seen.add(it["link"])
-                    dedup_items.append(it)
-            dedup_items.sort(key=lambda x: x["published"], reverse=True)
-
-            if dedup_items:
-                for it in dedup_items[:25]:
-                    t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
-                    st.markdown(f"- {tag_news(it['title'])} — [{it['title']}]({it['link']})  \n  _कीवर्ड: {it['keyword']} · {t} IST_")
