@@ -575,6 +575,165 @@ def news_cutoff_utc():
     "🗓️ Calendar", "💰 FII/DII+Nifty", "📦 Delivery%+Deals",
     "🏆 Gainers/Losers", "📰 News",
 ])
+# ---------- TAB: EMA/VOLUME SIGNALS ----------
+TIMEFRAMES = {
+    "15 Min": {"interval": "5m", "period": "5d", "resample": "15min", "intraday": True},
+    "1 Hour": {"interval": "60m", "period": "1mo", "resample": None, "intraday": True},
+    "Daily":  {"interval": "1d", "period": "6mo", "resample": None, "intraday": False},
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_tf_data(tf_key, symbols_tuple):
+    cfg = TIMEFRAMES[tf_key]
+    symbols = [yf_ticker_for_stock(s) for s in symbols_tuple]
+    try:
+        data = yf.download(symbols, period=cfg["period"], interval=cfg["interval"],
+                            group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return {}
+    out = {}
+    for stock in symbols_tuple:
+        sym = yf_ticker_for_stock(stock)
+        try:
+            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        if cfg["resample"]:
+            df = df.resample(cfg["resample"]).agg(
+                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+        if len(df) >= 51:
+            out[stock] = df
+    return out
+
+
+def check_ema_cross(df):
+    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
+    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+    if ema20.iloc[-2] <= ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]:
+        return "UP"
+    if ema20.iloc[-2] >= ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]:
+        return "DOWN"
+    return None
+
+
+def check_volume_spike(df, mult):
+    vol = df["Volume"]
+    if len(vol) < 21:
+        return None
+    avg_vol = vol.iloc[-21:-1].mean()
+    curr_vol = vol.iloc[-1]
+    if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
+        return curr_vol / avg_vol
+    return None
+
+
+with tab_signals:
+    st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
+    st.caption(
+        "")
+
+    local_tf = st.multiselect("टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()), default=signal_timeframes, key="signals_tf_local")
+    is_after_close = now_ist().hour >= 16
+    if is_after_close:
+        st.info("बाज़ार बंद — Intraday (15m/1h) सिग्नल आज के लिए hide हैं। सिर्फ Daily दिखेगा।")
+
+    rows = []
+    existing_keys = {a["key"] for a in st.session_state.alerts}
+    for tf_key in local_tf:
+        cfg = TIMEFRAMES[tf_key]
+        if cfg["intraday"] and is_after_close:
+            continue
+        tf_data = fetch_tf_data(tf_key, tuple(selected_stocks))
+        for stock, df in tf_data.items():
+            price, bar_time = df["Close"].iloc[-1], df.index[-1]
+            cross, vr = check_ema_cross(df), check_volume_spike(df, vol_mult)
+            if not cross and not vr:
+                continue
+
+            is_daily_spike = (tf_key == "Daily" and vr is not None)
+            type_parts = []
+            if cross:
+                type_parts.append("🟢 EMA UP" if cross == "UP" else "🔴 EMA DOWN")
+            if vr:
+                type_parts.append(f"⚡ Volume {vr:.1f}x")
+            stars = "🔥" if is_daily_spike else ("⭐⭐" if (cross and vr) else "⭐")
+            bar_time_str = bar_time.strftime("%H:%M %d-%b")
+
+            rows.append({
+                "सिग्नल": stars, "स्टॉक": stock, "टाइमफ्रेम": tf_key,
+                "टाइप": " + ".join(type_parts), "LTP": round(price, 2), "समय": bar_time_str,
+                "Chart": tv_link(tv_symbol_for_stock(stock)),
+            })
+
+            alert_key = f"{stock}|{tf_key}|{'+'.join(type_parts)}|{bar_time_str}"
+            if alert_key not in existing_keys:
+                st.session_state.alerts.append({
+                    "key": alert_key, "stock": stock, "tf": tf_key, "type": " + ".join(type_parts),
+                    "stars": stars, "time": bar_time_str, "logged_at": now_ist().strftime("%H:%M:%S"),
+                    "chart": tv_link(tv_symbol_for_stock(stock)),
+                })
+                existing_keys.add(alert_key)
+
+    if not rows:
+        st.success("अभी कोई नया सिग्नल नहीं है।")
+    else:
+        sig_df = pd.DataFrame(rows)
+        sort_rank = {"🔥": 3, "⭐⭐": 2, "⭐": 1}
+        sig_df["_sort"] = sig_df["सिग्नल"].map(sort_rank)
+        sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
+
+        def hl(row):
+            if row["सिग्नल"] == "🔥":
+                base = f"background-color:{COLOR_SPIKE_BG}"
+            elif row["सिग्नल"] == "⭐⭐":
+                base = "background-color:#e8d4f8"
+            elif "UP" in row["टाइप"]:
+                base = f"background-color:{COLOR_POS_BG}"
+            elif "DOWN" in row["टाइप"]:
+                base = f"background-color:{COLOR_NEG_BG}"
+            else:
+                base = "background-color:#fff2cc"
+            return [base] * len(row)
+
+        st.dataframe(
+            sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
+            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+        )
+
+# ---------- TAB: ALERTS ----------
+with tab_alerts:
+    st.subheader("🔔 Signal Alerts / Notifications")
+    
+    alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
+    st.metric("कुल Active Alerts", len(alerts))
+    if not alerts:
+        st.info("अभी कोई अलर्ट नहीं है। Signals टैब में नया signal मिलते ही यहां अपने-आप जुड़ जाएगा।")
+    else:
+        adf = pd.DataFrame(alerts)[["stars", "stock", "tf", "type", "time", "logged_at", "chart"]]
+        adf.columns = ["सिग्नल", "स्टॉक", "टाइमफ्रेम", "टाइप", "बार टाइम", "Alert मिला", "Chart"]
+
+        def hl_alert(row):
+            if row["सिग्नल"] == "🔥":
+                base = f"background-color:{COLOR_SPIKE_BG}"
+            elif "UP" in row["टाइप"]:
+                base = f"background-color:{COLOR_POS_BG}"
+            elif "DOWN" in row["टाइप"]:
+                base = f"background-color:{COLOR_NEG_BG}"
+            else:
+                base = "background-color:#fff2cc"
+            return [base] * len(row)
+
+        st.dataframe(
+            adf.style.apply(hl_alert, axis=1), use_container_width=True, hide_index=True,
+            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+        )
+        if st.button("🗑️ सभी Alerts अभी साफ करें"):
+            st.session_state.alerts = []
+            st.rerun()
+
 
 # ---------- TAB: GLOBAL MARKETS ----------
 with tab_global:
@@ -789,164 +948,6 @@ with tab_stocks:
             t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
             st.markdown(f"- {tag_news(it['title'])} — [{it['title']}]({it['link']})  \n  _{t} IST_")
 
-# ---------- TAB: EMA/VOLUME SIGNALS ----------
-TIMEFRAMES = {
-    "15 Min": {"interval": "5m", "period": "5d", "resample": "15min", "intraday": True},
-    "1 Hour": {"interval": "60m", "period": "1mo", "resample": None, "intraday": True},
-    "Daily":  {"interval": "1d", "period": "6mo", "resample": None, "intraday": False},
-}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_tf_data(tf_key, symbols_tuple):
-    cfg = TIMEFRAMES[tf_key]
-    symbols = [yf_ticker_for_stock(s) for s in symbols_tuple]
-    try:
-        data = yf.download(symbols, period=cfg["period"], interval=cfg["interval"],
-                            group_by="ticker", progress=False, threads=True)
-    except Exception:
-        return {}
-    out = {}
-    for stock in symbols_tuple:
-        sym = yf_ticker_for_stock(stock)
-        try:
-            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-        if cfg["resample"]:
-            df = df.resample(cfg["resample"]).agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-        if len(df) >= 51:
-            out[stock] = df
-    return out
-
-
-def check_ema_cross(df):
-    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
-    if ema20.iloc[-2] <= ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]:
-        return "UP"
-    if ema20.iloc[-2] >= ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]:
-        return "DOWN"
-    return None
-
-
-def check_volume_spike(df, mult):
-    vol = df["Volume"]
-    if len(vol) < 21:
-        return None
-    avg_vol = vol.iloc[-21:-1].mean()
-    curr_vol = vol.iloc[-1]
-    if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
-        return curr_vol / avg_vol
-    return None
-
-
-with tab_signals:
-    st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
-    st.caption(
-        "")
-
-    local_tf = st.multiselect("टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()), default=signal_timeframes, key="signals_tf_local")
-    is_after_close = now_ist().hour >= 16
-    if is_after_close:
-        st.info("बाज़ार बंद — Intraday (15m/1h) सिग्नल आज के लिए hide हैं। सिर्फ Daily दिखेगा।")
-
-    rows = []
-    existing_keys = {a["key"] for a in st.session_state.alerts}
-    for tf_key in local_tf:
-        cfg = TIMEFRAMES[tf_key]
-        if cfg["intraday"] and is_after_close:
-            continue
-        tf_data = fetch_tf_data(tf_key, tuple(selected_stocks))
-        for stock, df in tf_data.items():
-            price, bar_time = df["Close"].iloc[-1], df.index[-1]
-            cross, vr = check_ema_cross(df), check_volume_spike(df, vol_mult)
-            if not cross and not vr:
-                continue
-
-            is_daily_spike = (tf_key == "Daily" and vr is not None)
-            type_parts = []
-            if cross:
-                type_parts.append("🟢 EMA UP" if cross == "UP" else "🔴 EMA DOWN")
-            if vr:
-                type_parts.append(f"⚡ Volume {vr:.1f}x")
-            stars = "🔥" if is_daily_spike else ("⭐⭐" if (cross and vr) else "⭐")
-            bar_time_str = bar_time.strftime("%H:%M %d-%b")
-
-            rows.append({
-                "सिग्नल": stars, "स्टॉक": stock, "टाइमफ्रेम": tf_key,
-                "टाइप": " + ".join(type_parts), "LTP": round(price, 2), "समय": bar_time_str,
-                "Chart": tv_link(tv_symbol_for_stock(stock)),
-            })
-
-            alert_key = f"{stock}|{tf_key}|{'+'.join(type_parts)}|{bar_time_str}"
-            if alert_key not in existing_keys:
-                st.session_state.alerts.append({
-                    "key": alert_key, "stock": stock, "tf": tf_key, "type": " + ".join(type_parts),
-                    "stars": stars, "time": bar_time_str, "logged_at": now_ist().strftime("%H:%M:%S"),
-                    "chart": tv_link(tv_symbol_for_stock(stock)),
-                })
-                existing_keys.add(alert_key)
-
-    if not rows:
-        st.success("अभी कोई नया सिग्नल नहीं है।")
-    else:
-        sig_df = pd.DataFrame(rows)
-        sort_rank = {"🔥": 3, "⭐⭐": 2, "⭐": 1}
-        sig_df["_sort"] = sig_df["सिग्नल"].map(sort_rank)
-        sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
-
-        def hl(row):
-            if row["सिग्नल"] == "🔥":
-                base = f"background-color:{COLOR_SPIKE_BG}"
-            elif row["सिग्नल"] == "⭐⭐":
-                base = "background-color:#e8d4f8"
-            elif "UP" in row["टाइप"]:
-                base = f"background-color:{COLOR_POS_BG}"
-            elif "DOWN" in row["टाइप"]:
-                base = f"background-color:{COLOR_NEG_BG}"
-            else:
-                base = "background-color:#fff2cc"
-            return [base] * len(row)
-
-        st.dataframe(
-            sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
-        )
-
-# ---------- TAB: ALERTS ----------
-with tab_alerts:
-    st.subheader("🔔 Signal Alerts / Notifications")
-    
-    alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
-    st.metric("कुल Active Alerts", len(alerts))
-    if not alerts:
-        st.info("अभी कोई अलर्ट नहीं है। Signals टैब में नया signal मिलते ही यहां अपने-आप जुड़ जाएगा।")
-    else:
-        adf = pd.DataFrame(alerts)[["stars", "stock", "tf", "type", "time", "logged_at", "chart"]]
-        adf.columns = ["सिग्नल", "स्टॉक", "टाइमफ्रेम", "टाइप", "बार टाइम", "Alert मिला", "Chart"]
-
-        def hl_alert(row):
-            if row["सिग्नल"] == "🔥":
-                base = f"background-color:{COLOR_SPIKE_BG}"
-            elif "UP" in row["टाइप"]:
-                base = f"background-color:{COLOR_POS_BG}"
-            elif "DOWN" in row["टाइप"]:
-                base = f"background-color:{COLOR_NEG_BG}"
-            else:
-                base = "background-color:#fff2cc"
-            return [base] * len(row)
-
-        st.dataframe(
-            adf.style.apply(hl_alert, axis=1), use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
-        )
-        if st.button("🗑️ सभी Alerts अभी साफ करें"):
-            st.session_state.alerts = []
-            st.rerun()
 
 # ---------- TAB: ECONOMIC CALENDAR ----------
 with tab_calendar:
@@ -1170,3 +1171,4 @@ with tab_news:
                     t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
                     st.markdown(f"- {tag_news(it['title'])} — [{it['title']}]({it['link']})  \n  _कीवर्ड: {it['keyword']} · {t} IST_")
             st.caption("सभी headlines Google News की live RSS feed से हैं।")
+
