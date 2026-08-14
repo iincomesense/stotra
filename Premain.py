@@ -578,8 +578,8 @@ def news_cutoff_utc():
 
 # ---------- TAB: GLOBAL MARKETS ----------
 with tab_global:
-    st.subheader("🌍 Global Markets, Currencies, Commodities & Indices — Live (TradingView)")
-    st.caption("यह widget सीधे TradingView के live data से चलता है — पेज खोलते ही असल-समय भाव दिखेगा।")
+    st.subheader("🌍 Global Markets")
+    
     ticker_items = ",".join(
         '{"proName": "%s", "title": "%s"}' % (tvs, sym) for sym, _, _, tvs in GLOBAL_INSTRUMENTS
     )
@@ -614,8 +614,7 @@ with tab_global:
 
 # ---------- TAB: SECTOR INDEX & IMPACT ----------
 with tab_sector:
-    st.subheader("🏭 सेक्टर इंडेक्स — % बदलाव")
-    st.caption("🟢▲ = ऊपर · 🔴▼ = नीचे")
+    
     sector_quotes = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
     sec_rows = [{"Sector Index": name, "% Chg": f"{sector_quotes[yft]['pct']:+.2f}%" if yft in sector_quotes else "—"}
                 for name, yft in SECTOR_INDEX_TICKERS.items()]
@@ -921,8 +920,7 @@ with tab_signals:
 # ---------- TAB: ALERTS ----------
 with tab_alerts:
     st.subheader("🔔 Signal Alerts / Notifications")
-    st.caption(f"रोज़ रात {ALERT_CLEAR_HOUR_IST}:00 बजे यह लिस्ट अपने-आप खाली हो जाती है। "
-               f"🔥 = Daily Volume Spike · 🟢 = EMA UP · 🔴 = EMA DOWN")
+    
     alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
     st.metric("कुल Active Alerts", len(alerts))
     if not alerts:
@@ -958,7 +956,6 @@ with tab_calendar:
         st.metric("🔔 आज के Medium/High Importance Events", event_count)
     else:
         st.caption("आज के events की संख्या अभी लोड नहीं हो पाई — नीचे calendar में देखें।")
-    st.caption("सिर्फ़ ⭐⭐/⭐⭐⭐ (Medium + High) importance वाले events दिख रहे हैं।")
     components.html("""
         <div class="tradingview-widget-container">
           <div class="tradingview-widget-container__widget"></div>
@@ -1112,7 +1109,6 @@ with tab_movers:
 
 # ---------- TAB: NEWS (सुबह 8:30 - रात 8:30 विंडो) ----------
 with tab_news:
-    st.subheader("📰 News (Market)")
     st.caption("🏦")
 
     if not news_window_active():
