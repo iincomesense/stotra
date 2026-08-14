@@ -1,20 +1,17 @@
 """
-Full Market Dashboard (Streamlit) — Compact Edition
+Full Market Dashboard (Streamlit) — Ultra-Fast Edition
 =====================================================
 Global Markets + TradingView charts | Sector Index Impact | Stock
-Watchlist with live-flash news | EMA/Volume Signals + Alerts |
+Watchlist with live-flash news | EMA/Volume/RSI Signals + Alerts |
 Economic Calendar | FII/DII (Analysis-driven) + Nifty Option-OI |
 Delivery% (2-day compare) + Bulk/Block Deals | Gainers/Losers |
 Institutional-style News (8:30 AM - 8:30 PM window).
 
-बदलाव (इस version में):
-  1) News अब सुबह 8:30 से रात 8:30 तक की विंडो में रहती है, उसके बाद अपने-आप खाली।
-  2) Delivery% अब पिछले 2 दिन साथ-साथ दिखाता है (compare करने के लिए)।
-  3) Signals में Daily timeframe पर Volume Spike को अलग से 🔥 हाइलाइट मिलता है।
-  4) Signals और Alerts में 30 Min, 75 Min, 2 Hours, 4 Hours, और 6 Hours टाइमफ्रेम जोड़े गए हैं।
-  5) FII/DII अब सिर्फ लिंक नहीं — डाटा पर आधारित असल analysis/insight दिखाता है।
-
-Deploy: share.streamlit.io -> connect GitHub repo -> main file: app.py
+नवीनतम सुधार:
+  1) Signals/Alerts में Timeframe चुनते समय 'ALL' सलेक्ट करने की सुविधा।
+  2) EMA, Volume Spike और RSI को कस्टमाइज़/चुनने की सुविधा (नए इंडिकेटर्स आसानी से जोड़ें)।
+  3) ThreadPoolExecutor के ज़रिए Parallel Multi-timeframe Fast Scanning.
+  4) Alerts ऑटो-क्लियर (रात 8 बजे) व News Window (8:30 AM - 8:30 PM) बरकरार।
 """
 
 import concurrent.futures
@@ -178,7 +175,7 @@ div[data-testid="stMetricLabel"] { color: var(--dh-muted) !important; }
 """, unsafe_allow_html=True)
 
 
-# ============================== छोटे हेल्पर्स ==============================
+# ============================== HELPERS ==============================
 def now_ist():
     return datetime.now(IST)
 
@@ -201,7 +198,6 @@ def yf_ticker_for_stock(stock):
 
 
 def _parse_pct(val):
-    """कई formats को safely float में parse करता है।"""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -235,7 +231,6 @@ def pct_bg_style(val):
 
 
 def _styler_apply_map(styler, fn, subset):
-    """pandas नई/पुरानी दोनों versions पर काम करे (Styler.map बनाम .applymap)।"""
     if hasattr(styler, "map"):
         try:
             return styler.map(fn, subset=subset)
@@ -245,7 +240,6 @@ def _styler_apply_map(styler, fn, subset):
 
 
 def style_pct_columns(obj, cols):
-    """DataFrame या Styler दोनों ले सकता है। दिए गए % columns पर green/red background लगाता है।"""
     if isinstance(obj, pd.DataFrame):
         styler, available_cols = obj.style, obj.columns
     else:
@@ -257,7 +251,6 @@ def style_pct_columns(obj, cols):
 
 
 def fmt_change(chg, pct):
-    """Dhan-app जैसा combined format: '7.70 (+1.63%) ▲'"""
     if chg is None or pct is None:
         return "—"
     arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "●")
@@ -275,6 +268,58 @@ def tag_news(title):
     return "🔵 NEUTRAL"
 
 
+# ============================== TIMEFRAMES & INDICATOR ENGINES ==============================
+TIMEFRAMES = {
+    "15 Min":  {"interval": "5m",  "period": "5d",  "resample": "15min", "intraday": True},
+    "30 Min":  {"interval": "15m", "period": "1mo", "resample": "30min", "intraday": True},
+    "75 Min":  {"interval": "15m", "period": "1mo", "resample": "75min", "intraday": True},
+    "1 Hour":  {"interval": "60m", "period": "1mo", "resample": None,    "intraday": True},
+    "2 Hours": {"interval": "60m", "period": "3mo", "resample": "120min", "intraday": True},
+    "4 Hours": {"interval": "60m", "period": "3mo", "resample": "240min", "intraday": True},
+    "6 Hours": {"interval": "60m", "period": "3mo", "resample": "360min", "intraday": True},
+    "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
+}
+
+# --- EXTENSIBLE INDICATOR FUNCTIONS ---
+def check_ema_cross(df):
+    """EMA 20/50 Crossover Check"""
+    if len(df) < 50:
+        return None
+    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
+    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+    if ema20.iloc[-2] <= ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]:
+        return "🟢 EMA UP"
+    if ema20.iloc[-2] >= ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]:
+        return "🔴 EMA DOWN"
+    return None
+
+def check_volume_spike(df, mult=2.0):
+    """Volume Spike Multiplier Check"""
+    vol = df["Volume"]
+    if len(vol) < 21:
+        return None
+    avg_vol = vol.iloc[-21:-1].mean()
+    curr_vol = vol.iloc[-1]
+    if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
+        return f"⚡ Vol {curr_vol / avg_vol:.1f}x"
+    return None
+
+def check_rsi(df, period=14):
+    """RSI Overbought / Oversold Check (Extensible example)"""
+    if len(df) < period + 1:
+        return None
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    last_rsi = rsi.iloc[-1]
+    if last_rsi >= 70:
+        return f"🔥 RSI OB ({last_rsi:.0f})"
+    if last_rsi <= 30:
+        return f"🧊 RSI OS ({last_rsi:.0f})"
+    return None
+
 # ============================== SIDEBAR ==============================
 st.sidebar.header("⚙️ Settings")
 refresh_min = st.sidebar.slider("Auto-Refresh हर (मिनट)", 0.5, 15.0, 1.0, 0.5)
@@ -290,14 +335,28 @@ if st.sidebar.button("🔄 अभी Refresh करें"):
     st.rerun()
 
 selected_stocks = st.sidebar.multiselect("Watchlist", WATCHLIST_DEFAULT, default=WATCHLIST_DEFAULT)
-vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
-signal_timeframes = st.sidebar.multiselect(
-    "Signal Scan Timeframes", 
-    ["15 Min", "30 Min", "75 Min", "1 Hour", "2 Hours", "4 Hours", "6 Hours", "Daily"], 
-    default=["1 Hour", "Daily"],
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Signal & Indicator Settings")
+
+tf_options = ["ALL"] + list(TIMEFRAMES.keys())
+selected_tf_raw = st.sidebar.multiselect("Signal Scan Timeframes", tf_options, default=["1 Hour", "Daily"])
+
+# 'ALL' चुनते ही सारे टाइमफ्रेम ऑटो-सलेक्ट हो जाते हैं
+if "ALL" in selected_tf_raw:
+    signal_timeframes = list(TIMEFRAMES.keys())
+else:
+    signal_timeframes = selected_tf_raw
+
+selected_indicators = st.sidebar.multiselect(
+    "इंडिकेटर चुनें (Signals)",
+    ["EMA Crossover (20/50)", "Volume Spike", "RSI (14)"],
+    default=["EMA Crossover (20/50)", "Volume Spike"]
 )
 
-# ============================== ALERTS STATE (रात 8 बजे auto-clear) ==============================
+vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
+
+# ============================== ALERTS STATE ==============================
 if "alerts" not in st.session_state:
     st.session_state.alerts = []
 if "alerts_clear_date" not in st.session_state:
@@ -370,6 +429,47 @@ def get_quotes(tickers):
     return quotes
 
 
+# ============================== FAST PARALLEL TIMEFRAME SCANNER ==============================
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_tf_data_single(tf_key, symbols_tuple):
+    cfg = TIMEFRAMES[tf_key]
+    symbols = [yf_ticker_for_stock(s) for s in symbols_tuple]
+    try:
+        data = yf.download(symbols, period=cfg["period"], interval=cfg["interval"],
+                            group_by="ticker", progress=False, threads=True)
+    except Exception:
+        return {}
+    out = {}
+    for stock in symbols_tuple:
+        sym = yf_ticker_for_stock(stock)
+        try:
+            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        if cfg["resample"]:
+            df = df.resample(cfg["resample"]).agg(
+                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+        if len(df) >= 20:
+            out[stock] = df
+    return out
+
+
+def fetch_all_tf_data_fast(selected_tfs, stocks_tuple):
+    """ThreadPoolExecutor का उपयोग करके सभी टाइमफ्रेम का डेटा Parallel फास्ट डाउनलोड करें"""
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(selected_tfs), 8)) as executor:
+        future_to_tf = {executor.submit(fetch_tf_data_single, tf, stocks_tuple): tf for tf in selected_tfs}
+        for future in concurrent.futures.as_completed(future_to_tf):
+            tf = future_to_tf[future]
+            try:
+                results[tf] = future.result()
+            except Exception:
+                results[tf] = {}
+    return results
+
+
 # ============================== NSE / FALLBACK DATA ==============================
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_nse_json(api_path):
@@ -387,7 +487,6 @@ def fetch_nse_json(api_path):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_fii_dii():
-    """FII/DII डाटा — पहले StockEdge लिंक (5 दिन), फिर NSE API fallback।"""
     try:
         r = requests.get("https://sedg.in/p8nximtd", headers=NSE_HEADERS, timeout=10, allow_redirects=True)
         for t in pd.read_html(io.StringIO(r.text)):
@@ -402,16 +501,13 @@ def fetch_fii_dii():
 
 
 def fii_dii_insight(df):
-    """डाटा से खुद insight निकालता है — सिर्फ लिंक नहीं, असल analysis।"""
     try:
         cols_lower = {c.lower(): c for c in df.columns}
         net_col = cols_lower.get("netvalue") or cols_lower.get("net_value")
         cat_col = cols_lower.get("category")
         if not net_col or not cat_col:
             return None
-        latest = df.iloc[0] if "date" not in cols_lower else df
-        fii_net = None
-        dii_net = None
+        fii_net, dii_net = None, None
         for _, row in df.iterrows():
             cat = str(row[cat_col]).upper()
             try:
@@ -424,13 +520,13 @@ def fii_dii_insight(df):
                 dii_net = val if dii_net is None else dii_net
         if fii_net is None and dii_net is None:
             return None
-        if fii_net is not None and fii_net > 0 and dii_net is not None and dii_net > 0:
+        if fii_net > 0 and dii_net > 0:
             return "success", f"🟢 FII (₹{fii_net:+.0f} Cr) और DII (₹{dii_net:+.0f} Cr) दोनों खरीदार — Bullish bias।"
-        if fii_net is not None and fii_net < 0 and dii_net is not None and dii_net > 0:
+        if fii_net < 0 and dii_net > 0:
             return "info", f"🔵 FII बिकवाली (₹{fii_net:+.0f} Cr) पर DII (₹{dii_net:+.0f} Cr) सपोर्ट दे रहे हैं — गिरावट सीमित रह सकती है।"
-        if fii_net is not None and fii_net > 0 and dii_net is not None and dii_net < 0:
+        if fii_net > 0 and dii_net < 0:
             return "info", f"🔵 FII खरीदारी (₹{fii_net:+.0f} Cr) कर रहे, DII बेच रहे (₹{dii_net:+.0f} Cr) — मिला-जुला संकेत।"
-        if fii_net is not None and fii_net < 0 and dii_net is not None and dii_net < 0:
+        if fii_net < 0 and dii_net < 0:
             return "error", f"🔴 FII (₹{fii_net:+.0f} Cr) और DII (₹{dii_net:+.0f} Cr) दोनों बिकवाल — Cautious bias।"
         return None
     except Exception:
@@ -461,11 +557,10 @@ def get_last_n_trading_bhavcopies(n=2, lookback_days=15):
             results.append((cursor, df))
         cursor -= timedelta(days=1)
         tries += 1
-    return list(reversed(results))  # पुराना -> नया
+    return list(reversed(results))
 
 
 def get_delivery_2day_compare(stocks):
-    """पिछले 2 ट्रेडिंग दिनों का Delivery% साथ-साथ (compare के लिए)।"""
     data = get_last_n_trading_bhavcopies(2)
     if len(data) < 2:
         return None, None
@@ -554,15 +649,12 @@ def fetch_nse_corporate_announcements():
     return items
 
 
-# ============================== NEWS WINDOW हेल्पर (8:30 AM - 8:30 PM) ==============================
 def news_window_active():
-    """रात 8:30 के बाद से सुबह 8:30 तक विंडो बंद (news list खाली) रहती है।"""
     t = now_ist().time()
     return NEWS_WINDOW_START <= t <= NEWS_WINDOW_END
 
 
 def news_cutoff_utc():
-    """आज सुबह 8:30 IST को UTC में बदलकर देता है — इससे पहले की news नहीं दिखेगी।"""
     start_ist = now_ist().replace(hour=NEWS_WINDOW_START.hour, minute=NEWS_WINDOW_START.minute,
                                    second=0, microsecond=0)
     return start_ist.astimezone(timezone.utc)
@@ -614,7 +706,6 @@ with tab_global:
 
 # ---------- TAB: SECTOR INDEX & IMPACT ----------
 with tab_sector:
-    
     sector_quotes = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
     sec_rows = [{"Sector Index": name, "% Chg": f"{sector_quotes[yft]['pct']:+.2f}%" if yft in sector_quotes else "—"}
                 for name, yft in SECTOR_INDEX_TICKERS.items()]
@@ -625,7 +716,6 @@ with tab_sector:
 
     st.markdown("---")
     st.subheader("📌 Global + India Macro के आधार पर Impact (कारण सहित)")
-    st.caption("Rule-based heuristic — सिर्फ जानकारी के लिए, यह वित्तीय सलाह नहीं है।")
     quotes_map = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
 
     def q(yft):
@@ -673,19 +763,6 @@ with tab_sector:
         impact_rows.append({"sector": "Metals",
                              "stocks": ["HINDALCO", "VEDL", "NATIONALUM", "TATASTEEL", "JSWSTEEL", "JINDALSTEL"],
                              "signal": tag, "reason": f"Copper {copper['pct']:+.2f}% — base-metal sentiment"})
-
-    if gold and abs(gold["pct"]) >= 0.5:
-        tag = "🟢 Positive" if gold["pct"] > 0 else "🔴 Negative"
-        impact_rows.append({"sector": "Gold-linked", "stocks": ["TITAN"], "signal": tag, "reason": f"Gold {gold['pct']:+.2f}%"})
-
-    if natgas and abs(natgas["pct"]) >= 1.0:
-        tag = "🟢 Positive" if natgas["pct"] > 0 else "🔴 Negative"
-        impact_rows.append({"sector": "Gas Utility", "stocks": ["GAIL"], "signal": tag, "reason": f"Natural Gas {natgas['pct']:+.2f}%"})
-
-    if dxy and abs(dxy["pct"]) >= 0.2:
-        tag = "🔴 Negative" if dxy["pct"] > 0 else "🟢 Positive"
-        impact_rows.append({"sector": "Broad Nifty / EM Risk Sentiment", "stocks": [], "signal": tag,
-                             "reason": f"DXY {dxy['pct']:+.2f}% — डॉलर की मज़बूती/कमज़ोरी का global risk-appetite पर असर"})
 
     if not impact_rows:
         st.info("आज कोई भी macro driver threshold से ऊपर move नहीं हुआ — कोई स्पष्ट सेक्टर bias नहीं।")
@@ -756,175 +833,105 @@ with tab_stocks:
             "News (24h)": st.column_config.LinkColumn("News (24h)", display_text="📰 पढ़ें"),
         },
     )
-    st.caption("📰 सिर्फ़ वो स्टॉक जिनकी पिछले 24 घंटे में कोई खबर मिली, वहाँ लिंक दिखेगा।")
 
-    st.markdown("---")
-    st.markdown("**किसी एक स्टॉक की ताज़ा News देखें:**")
-    news_stock = st.selectbox("स्टॉक चुनें", selected_stocks)
-
-    @st.cache_data(ttl=600, show_spinner=False)
-    def fetch_stock_news(stock_name):
-        if feedparser is None:
-            return []
-        query = urllib.parse.quote_plus(f"{stock_name} NSE stock when:1d")
-        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-        try:
-            feed = feedparser.parse(requests.get(url, timeout=15).content)
-        except Exception:
-            return []
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        items = []
-        for e in feed.entries[:10]:
-            pub = e.get("published_parsed")
-            if pub and datetime(*pub[:6], tzinfo=timezone.utc) >= cutoff:
-                items.append({"title": e.title, "link": e.link, "published": datetime(*pub[:6], tzinfo=timezone.utc)})
-        return items
-
-    with st.spinner("News fetch हो रही है..."):
-        s_news = fetch_stock_news(news_stock)
-    if not s_news:
-        st.info(f"{news_stock} के लिए पिछले 24 घंटे में कोई ताज़ा खबर नहीं मिली।")
-    else:
-        for it in s_news:
-            t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
-            st.markdown(f"- {tag_news(it['title'])} — [{it['title']}]({it['link']})  \n  _{t} IST_")
-
-# ---------- TAB: EMA/VOLUME SIGNALS ----------
-TIMEFRAMES = {
-    "15 Min":  {"interval": "5m",  "period": "5d",  "resample": "15min", "intraday": True},
-    "30 Min":  {"interval": "15m", "period": "1mo", "resample": "30min", "intraday": True},
-    "75 Min":  {"interval": "15m", "period": "1mo", "resample": "75min", "intraday": True},
-    "1 Hour":  {"interval": "60m", "period": "1mo", "resample": None,    "intraday": True},
-    "2 Hours": {"interval": "60m", "period": "3mo", "resample": "120min", "intraday": True},
-    "4 Hours": {"interval": "60m", "period": "3mo", "resample": "240min", "intraday": True},
-    "6 Hours": {"interval": "60m", "period": "3mo", "resample": "360min", "intraday": True},
-    "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
-}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_tf_data(tf_key, symbols_tuple):
-    cfg = TIMEFRAMES[tf_key]
-    symbols = [yf_ticker_for_stock(s) for s in symbols_tuple]
-    try:
-        data = yf.download(symbols, period=cfg["period"], interval=cfg["interval"],
-                            group_by="ticker", progress=False, threads=True)
-    except Exception:
-        return {}
-    out = {}
-    for stock in symbols_tuple:
-        sym = yf_ticker_for_stock(stock)
-        try:
-            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-        if cfg["resample"]:
-            df = df.resample(cfg["resample"]).agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-        if len(df) >= 51:
-            out[stock] = df
-    return out
-
-
-def check_ema_cross(df):
-    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
-    if ema20.iloc[-2] <= ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]:
-        return "UP"
-    if ema20.iloc[-2] >= ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]:
-        return "DOWN"
-    return None
-
-
-def check_volume_spike(df, mult):
-    vol = df["Volume"]
-    if len(vol) < 21:
-        return None
-    avg_vol = vol.iloc[-21:-1].mean()
-    curr_vol = vol.iloc[-1]
-    if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
-        return curr_vol / avg_vol
-    return None
-
-
+# ---------- TAB: FAST EMA/VOLUME/RSI SIGNALS ----------
 with tab_signals:
-    st.subheader("📊 EMA 20×50 Crossover + Volume Spike Signals")
-    st.caption("स्कैन किए जाने वाले टाइमफ्रेम: 15 Min, 30 Min, 75 Min, 1 Hour, 2 Hours, 4 Hours, 6 Hours, Daily")
+    st.subheader("📊 Signals (Fast Parallel Scan)")
+    st.caption("चुने गए टाइमफ्रेम और एक्टिव इंडिकेटर्स के आधार पर फ़ास्ट ऑटो-स्कैन।")
 
-    local_tf = st.multiselect("टाइमफ्रेम चुनें", list(TIMEFRAMES.keys()), default=signal_timeframes, key="signals_tf_local")
     is_after_close = now_ist().hour >= 16
     if is_after_close:
-        st.info("बाज़ार बंद — Intraday (15m से 6h) सिग्नल आज के लिए hide हैं। सिर्फ Daily दिखेगा।")
+        st.info("बाज़ार बंद — Intraday (15m से 6h) सिग्नल hide हैं। सिर्फ Daily टाइमफ्रेम दिखेगा।")
 
-    rows = []
-    existing_keys = {a["key"] for a in st.session_state.alerts}
-    for tf_key in local_tf:
-        cfg = TIMEFRAMES[tf_key]
-        if cfg["intraday"] and is_after_close:
-            continue
-        tf_data = fetch_tf_data(tf_key, tuple(selected_stocks))
-        for stock, df in tf_data.items():
-            price, bar_time = df["Close"].iloc[-1], df.index[-1]
-            cross, vr = check_ema_cross(df), check_volume_spike(df, vol_mult)
-            if not cross and not vr:
-                continue
+    valid_tfs = [tf for tf in signal_timeframes if not (TIMEFRAMES[tf]["intraday"] and is_after_close)]
 
-            is_daily_spike = (tf_key == "Daily" and vr is not None)
-            type_parts = []
-            if cross:
-                type_parts.append("🟢 EMA UP" if cross == "UP" else "🔴 EMA DOWN")
-            if vr:
-                type_parts.append(f"⚡ Volume {vr:.1f}x")
-            stars = "🔥" if is_daily_spike else ("⭐⭐" if (cross and vr) else "⭐")
-            bar_time_str = bar_time.strftime("%H:%M %d-%b")
-
-            rows.append({
-                "सिग्नल": stars, "स्टॉक": stock, "टाइमफ्रेम": tf_key,
-                "टाइप": " + ".join(type_parts), "LTP": round(price, 2), "समय": bar_time_str,
-                "Chart": tv_link(tv_symbol_for_stock(stock)),
-            })
-
-            alert_key = f"{stock}|{tf_key}|{'+'.join(type_parts)}|{bar_time_str}"
-            if alert_key not in existing_keys:
-                st.session_state.alerts.append({
-                    "key": alert_key, "stock": stock, "tf": tf_key, "type": " + ".join(type_parts),
-                    "stars": stars, "time": bar_time_str, "logged_at": now_ist().strftime("%H:%M:%S"),
-                    "chart": tv_link(tv_symbol_for_stock(stock)),
-                })
-                existing_keys.add(alert_key)
-
-    if not rows:
-        st.success("अभी कोई नया सिग्नल नहीं है।")
+    if not valid_tfs:
+        st.warning("कोई टाइमफ्रेम सलेक्टेड नहीं है। साइडबार से 'ALL' या टाइमफ्रेम चुनें।")
     else:
-        sig_df = pd.DataFrame(rows)
-        sort_rank = {"🔥": 3, "⭐⭐": 2, "⭐": 1}
-        sig_df["_sort"] = sig_df["सिग्नल"].map(sort_rank)
-        sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
+        with st.spinner("⚡ Fast Scanning (Parallel Processing) चल रहा है..."):
+            all_tf_data = fetch_all_tf_data_fast(valid_tfs, tuple(selected_stocks))
 
-        def hl(row):
-            if row["सिग्नल"] == "🔥":
-                base = f"background-color:{COLOR_SPIKE_BG}"
-            elif row["सिग्नल"] == "⭐⭐":
-                base = "background-color:#e8d4f8"
-            elif "UP" in row["टाइप"]:
-                base = f"background-color:{COLOR_POS_BG}"
-            elif "DOWN" in row["टाइप"]:
-                base = f"background-color:{COLOR_NEG_BG}"
-            else:
-                base = "background-color:#fff2cc"
-            return [base] * len(row)
+        rows = []
+        existing_keys = {a["key"] for a in st.session_state.alerts}
 
-        st.dataframe(
-            sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
-        )
+        for tf_key in valid_tfs:
+            tf_data = all_tf_data.get(tf_key, {})
+            for stock, df in tf_data.items():
+                price, bar_time = df["Close"].iloc[-1], df.index[-1]
+                
+                type_parts = []
+                is_daily_vol_spike = False
+
+                # 1. EMA Crossover
+                if "EMA Crossover (20/50)" in selected_indicators:
+                    cross = check_ema_cross(df)
+                    if cross:
+                        type_parts.append(cross)
+
+                # 2. Volume Spike
+                if "Volume Spike" in selected_indicators:
+                    vr = check_volume_spike(df, vol_mult)
+                    if vr:
+                        type_parts.append(vr)
+                        if tf_key == "Daily":
+                            is_daily_vol_spike = True
+
+                # 3. RSI
+                if "RSI (14)" in selected_indicators:
+                    rsi_sig = check_rsi(df)
+                    if rsi_sig:
+                        type_parts.append(rsi_sig)
+
+                if not type_parts:
+                    continue
+
+                stars = "🔥" if is_daily_vol_spike else ("⭐⭐" if len(type_parts) >= 2 else "⭐")
+                bar_time_str = bar_time.strftime("%H:%M %d-%b")
+
+                rows.append({
+                    "सिग्नल": stars, "स्टॉक": stock, "टाइमफ्रेम": tf_key,
+                    "टाइप": " | ".join(type_parts), "LTP": round(price, 2), "समय": bar_time_str,
+                    "Chart": tv_link(tv_symbol_for_stock(stock)),
+                })
+
+                alert_key = f"{stock}|{tf_key}|{'|'.join(type_parts)}|{bar_time_str}"
+                if alert_key not in existing_keys:
+                    st.session_state.alerts.append({
+                        "key": alert_key, "stock": stock, "tf": tf_key, "type": " | ".join(type_parts),
+                        "stars": stars, "time": bar_time_str, "logged_at": now_ist().strftime("%H:%M:%S"),
+                        "chart": tv_link(tv_symbol_for_stock(stock)),
+                    })
+                    existing_keys.add(alert_key)
+
+        if not rows:
+            st.success("चुने गए इंडिकेटर्स/टाइमफ्रेम पर अभी कोई नया सिग्नल नहीं मिला।")
+        else:
+            sig_df = pd.DataFrame(rows)
+            sort_rank = {"🔥": 3, "⭐⭐": 2, "⭐": 1}
+            sig_df["_sort"] = sig_df["सिग्नल"].map(sort_rank)
+            sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
+
+            def hl(row):
+                if row["सिग्नल"] == "🔥":
+                    base = f"background-color:{COLOR_SPIKE_BG}"
+                elif row["सिग्नल"] == "⭐⭐":
+                    base = "background-color:#e8d4f8"
+                elif "UP" in row["टाइप"]:
+                    base = f"background-color:{COLOR_POS_BG}"
+                elif "DOWN" in row["टाइप"]:
+                    base = f"background-color:{COLOR_NEG_BG}"
+                else:
+                    base = "background-color:#fff2cc"
+                return [base] * len(row)
+
+            st.dataframe(
+                sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
+                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+            )
 
 # ---------- TAB: ALERTS ----------
 with tab_alerts:
     st.subheader("🔔 Signal Alerts / Notifications")
-    
     alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
     st.metric("कुल Active Alerts", len(alerts))
     if not alerts:
@@ -958,8 +965,6 @@ with tab_calendar:
     event_count = fetch_economic_event_count_today()
     if event_count is not None:
         st.metric("🔔 आज के Medium/High Importance Events", event_count)
-    else:
-        st.caption("आज के events की संख्या अभी लोड नहीं हो पाई — नीचे calendar में देखें।")
     components.html("""
         <div class="tradingview-widget-container">
           <div class="tradingview-widget-container__widget"></div>
@@ -987,16 +992,12 @@ with tab_fii:
             if insight:
                 level, msg = insight
                 getattr(st, level)(msg)
-            else:
-                st.caption("Insight निकालने के लिए डाटा फॉर्मेट पहचाना नहीं जा सका — नीचे raw table देखें।")
 
             with st.expander("📅 पिछले 5 दिन का पूरा डाटा देखें"):
                 st.dataframe(fii_df, use_container_width=True, hide_index=True)
             st.caption(f"Source: {source}")
         else:
             st.warning("किसी भी सोर्स से live FII/DII data नहीं मिल पाया।")
-            st.markdown("- [StockEdge Link](https://sedg.in/p8nximtd)")
-            st.markdown("- [NSE FII/DII Reports](https://www.nseindia.com/reports-indices-historical-index-data)")
 
     with col_nifty:
         st.markdown("### 🎯 Nifty 50 — Data-Driven Outlook")
@@ -1023,27 +1024,20 @@ with tab_fii:
                 c3.metric("Support", support if support else "—")
                 if pcr:
                     bias = "Mildly Bullish" if pcr > 1.1 else "Mildly Bearish" if pcr < 0.8 else "Range-bound / Neutral"
-                    st.info(f"📌 **{bias}** (PCR={pcr}). Support ~{support}, Resistance ~{resistance}. "
-                            f"यह सिर्फ़ मौजूदा Option-OI डेटा है, guaranteed prediction नहीं।")
+                    st.info(f"📌 **{bias}** (PCR={pcr}). Support ~{support}, Resistance ~{resistance}.")
             except Exception:
                 st.warning("Option-chain data parse नहीं हो पाया।")
         else:
             st.warning("NSE Option-Chain data नहीं मिला।")
-            st.markdown("- [NSE Option Chain](https://www.nseindia.com/option-chain)")
-        st.caption("यह पैनल का OI डेटा असली NSE से है, वित्तीय सलाह नहीं है।")
 
 # ---------- TAB: DELIVERY % (2-दिन Compare) + BULK/BLOCK DEALS ----------
 with tab_delivery:
     st.subheader("📦 Delivery % — पिछले 2 दिन (Compare के लिए)")
-    st.caption("Data source: NSE Bhavcopy · हरा = delivery% बढ़ा · लाल = घटा")
     with st.spinner("पिछले 2 दिन का delivery data देखा जा रहा है..."):
         deliv_date, deliv_rows = get_delivery_2day_compare(selected_stocks)
 
-    if deliv_date is None:
-        st.warning("NSE Archives से data नहीं मिल पाया (cloud IP block संभव)। सीधे देखें:")
-        st.markdown("- [NSE Historical Delivery Data](https://www.nseindia.com/report-detail/eq_security)")
-    elif not deliv_rows:
-        st.info("इस watchlist के लिए delivery data नहीं मिला।")
+    if deliv_date is None or not deliv_rows:
+        st.info("Delivery data लोड नहीं हो सका या watchlist खाली है।")
     else:
         ddf = pd.DataFrame(deliv_rows).sort_values("बदलाव", ascending=False)
 
@@ -1063,9 +1057,7 @@ with tab_delivery:
     st.markdown("---")
     st.subheader("🏦 Bulk / Block Deals (आपकी Watchlist में)")
     deals_data = fetch_bulk_block_deals()
-    if not deals_data:
-        st.caption("आज का Bulk/Block deal data अभी उपलब्ध नहीं (NSE से fetch नहीं हो पाया)।")
-    else:
+    if deals_data:
         bulk = filter_deals_for_watchlist(deals_data.get("BULK_DEALS_DATA", []), selected_stocks)
         block = filter_deals_for_watchlist(deals_data.get("BLOCK_DEALS_DATA", []), selected_stocks)
         if bulk is not None and not bulk.empty:
@@ -1074,13 +1066,10 @@ with tab_delivery:
         if block is not None and not block.empty:
             st.markdown("**Block Deals**")
             st.dataframe(block, use_container_width=True, hide_index=True)
-        if (bulk is None or bulk.empty) and (block is None or block.empty):
-            st.caption("आपकी watchlist के किसी स्टॉक में आज कोई Bulk/Block deal नहीं मिला।")
 
 # ---------- TAB: TOP GAINERS / LOSERS ----------
 with tab_movers:
     st.subheader("🏆 Top 5 Gainers & Top 5 Losers")
-    st.caption("🟢▲ = ऊपर · 🔴▼ = नीचे")
     quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
     mv_rows = []
     for s in selected_stocks:
@@ -1089,9 +1078,7 @@ with tab_movers:
             mv_rows.append({"Stock": s, "LTP": qd["price"], "pct": qd["pct"], "chg": qd.get("chg"),
                              "Chart": tv_link(tv_symbol_for_stock(s))})
     mv_df = pd.DataFrame(mv_rows)
-    if mv_df.empty:
-        st.info("डेटा लोड हो रहा है, थोड़ी देर में refresh करें।")
-    else:
+    if not mv_df.empty:
         gainers = mv_df.sort_values("pct", ascending=False).head(5).copy()
         losers = mv_df.sort_values("pct", ascending=True).head(5).copy()
         for _df in (gainers, losers):
@@ -1111,24 +1098,21 @@ with tab_movers:
             column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
         )
 
-# ---------- TAB: NEWS (सुबह 8:30 - रात 8:30 विंडो) ----------
+# ---------- TAB: NEWS ----------
 with tab_news:
-    st.caption("🏦")
-
     if not news_window_active():
         st.info("⏰ अभी News विंडो (8:30 AM – 8:30 PM) के बाहर है — कल सुबह 8:30 बजे फिर से news दिखेगी।")
     else:
         st.markdown("### 🏦 Direct Exchange Filings (NSE Corporate Announcements)")
-        with st.spinner("NSE filings लाई जा रही हैं..."):
-            filings = fetch_nse_corporate_announcements()
+        filings = fetch_nse_corporate_announcements()
         watch_set = set(selected_stocks)
         relevant_filings = [f for f in filings if f["symbol"] in watch_set]
-        if not relevant_filings:
-            st.info("आपकी watchlist से जुड़ी कोई ताज़ा corporate filing अभी नहीं मिली।")
-        else:
+        if relevant_filings:
             for f in relevant_filings[:15]:
                 link = f["attachment"] or "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
                 st.markdown(f"- **{f['symbol']}** — [{f['subject']}]({link})  \n  _{f['time']}_")
+        else:
+            st.info("आपकी watchlist से जुड़ी कोई ताज़ा corporate filing अभी नहीं मिली।")
 
         st.markdown("---")
 
@@ -1152,25 +1136,19 @@ with tab_news:
                         items.append({"title": e.title, "link": e.link, "published": pub_dt, "keyword": keyword})
             return items
 
-        if feedparser is None:
-            st.error("`feedparser` install नहीं है।")
-        else:
+        if feedparser is not None:
             st.markdown("### 🎯 टारगेटेड मार्केट-मूविंग न्यूज़ (सुबह 8:30 से अब तक)")
-            with st.spinner("कीवर्ड-आधारित न्यूज़ लाई जा रही है..."):
-                all_items = []
-                for kw in NEWS_KEYWORDS:
-                    all_items.extend(fetch_keyword_news(kw))
-                seen, dedup_items = set(), []
-                for it in all_items:
-                    if it["link"] not in seen:
-                        seen.add(it["link"])
-                        dedup_items.append(it)
-                dedup_items.sort(key=lambda x: x["published"], reverse=True)
+            all_items = []
+            for kw in NEWS_KEYWORDS:
+                all_items.extend(fetch_keyword_news(kw))
+            seen, dedup_items = set(), []
+            for it in all_items:
+                if it["link"] not in seen:
+                    seen.add(it["link"])
+                    dedup_items.append(it)
+            dedup_items.sort(key=lambda x: x["published"], reverse=True)
 
-            if not dedup_items:
-                st.info("आज सुबह 8:30 से अब तक कोई नई मार्केट-मूविंग खबर नहीं मिली।")
-            else:
+            if dedup_items:
                 for it in dedup_items[:25]:
                     t = it["published"].astimezone(IST).strftime("%d-%b %H:%M")
                     st.markdown(f"- {tag_news(it['title'])} — [{it['title']}]({it['link']})  \n  _कीवर्ड: {it['keyword']} · {t} IST_")
-            st.caption("सभी headlines Google News की live RSS feed से हैं।")
