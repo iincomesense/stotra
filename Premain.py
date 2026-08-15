@@ -1019,7 +1019,7 @@ with tab_global:
 
 # ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
-    st.subheader("🧠 Real-Time AI Market Intelligence & Opening Hypothesis Engine")
+    st.subheader(" Real-Time AI Market Intelligence & Opening Hypothesis Engine")
     st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Demand/Supply Zones + Real-Time Signal Alerts")
 
     with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा एनालाइज कर रहा है..."):
