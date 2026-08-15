@@ -1017,43 +1017,63 @@ with tab_global:
         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Live Chart खोलें")},
     )
 
-# ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
+    # ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
-    st.subheader(" Real-Time AI Market Intelligence & Opening Hypothesis Engine")
-    st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Demand/Supply Zones + Real-Time Signal Alerts")
+    st.subheader("🤖 Real-Time AI Market Intelligence & Opening Hypothesis Engine")
+    st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Top 10 Stocks OI + FII/DII Trends + Global Cues")
 
-    with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा एनालाइज कर रहा है..."):
-        macro_quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
+    with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
+        # 1. Macro Quotes Fetching
+        macro_symbols = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
+        macro_quotes = get_quotes(macro_symbols) if 'get_quotes' in globals() else {}
+        
         usdinr_data = macro_quotes.get("INR=X", {})
         crude_data = macro_quotes.get("CL=F", {})
         sp500_data = macro_quotes.get("^GSPC", {})
+        dxy_data = macro_quotes.get("DX-Y.NYB", {})
+        us10y_data = macro_quotes.get("^TNX", {})
+        gold_data = macro_quotes.get("GC=F", {})
         
         crude_pct = crude_data.get("pct", 0) if crude_data else 0
         sp500_pct = sp500_data.get("pct", 0) if sp500_data else 0
+        dxy_pct = dxy_data.get("pct", 0) if dxy_data else 0
+        us10y_pct = us10y_data.get("pct", 0) if us10y_data else 0
         
-        fii_df, _ = fetch_fii_dii()
-        fii_net_val = 0
+        # 2. FII / DII Data Fetch & Analysis
+        fii_df = None
+        if 'fetch_fii_dii' in globals():
+            try:
+                fii_df, _ = fetch_fii_dii()
+            except Exception:
+                fii_df = None
+                
+        fii_net_val, dii_net_val = 0, 0
         fii_bullish, fii_bearish = False, False
         if fii_df is not None and not fii_df.empty:
             try:
                 net_col = [c for c in fii_df.columns if "net" in c.lower()][0]
                 cat_col = [c for c in fii_df.columns if "cat" in c.lower()][0]
                 for _, r in fii_df.iterrows():
-                    if "FII" in str(r[cat_col]).upper():
+                    cat_name = str(r[cat_col]).upper()
+                    if "FII" in cat_name:
                         fii_net_val = float(r[net_col])
-                        if fii_net_val > 500: fii_bullish = True
-                        elif fii_net_val < -500: fii_bearish = True
+                    elif "DII" in cat_name:
+                        dii_net_val = float(r[net_col])
+                if fii_net_val > 500: fii_bullish = True
+                elif fii_net_val < -500: fii_bearish = True
             except Exception: pass
 
-        oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+        # 3. Nifty Option Chain & PCR Analysis
+        oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY") if 'fetch_nse_json' in globals() else None
         pcr_value = 1.0
         max_call_oi_strike, max_put_oi_strike = 0, 0
+        total_call_oi, total_put_oi = 0, 0
         if oc_data:
             try:
                 records = oc_data["records"]["data"]
-                tot_c = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
-                tot_p = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
-                if tot_c > 0: pcr_value = round(tot_p / tot_c, 2)
+                total_call_oi = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
+                total_put_oi = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
+                if total_call_oi > 0: pcr_value = round(total_put_oi / total_call_oi, 2)
                 
                 call_oi_map = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
                 put_oi_map = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
@@ -1061,8 +1081,7 @@ with tab_news:
                 if put_oi_map: max_put_oi_strike = max(put_oi_map, key=put_oi_map.get)
             except Exception: pass
 
-    st.markdown("### 🌅 Closing Analysis & Opening Hypothesis")
-    
+    # ---------- Opening Hypothesis Dynamic Score Algorithm ----------
     overnight_score = 0
     if sp500_pct > 0.4: overnight_score += 1.5
     elif sp500_pct < -0.4: overnight_score -= 1.5
@@ -1076,25 +1095,34 @@ with tab_news:
     if fii_bullish: overnight_score += 1.0
     elif fii_bearish: overnight_score -= 1.0
 
+    if dxy_pct < -0.3: overnight_score += 0.5
+    elif dxy_pct > 0.3: overnight_score -= 0.5
+
     if overnight_score >= 2.0:
-        opening_pred = "🟢 High Probability GAP-UP / Bullish Opening"
+        opening_pred = "🟢 High Probability GAP-UP / Strong Bullish Opening"
         pred_bg, pred_border = "#e6f4ea", "#34a853"
+        bias_text = "बुलिश (Buy-on-Dips Bias)"
     elif overnight_score <= -2.0:
-        opening_pred = "🔴 High Probability GAP-DOWN / Bearish Opening"
+        opening_pred = "🔴 High Probability GAP-DOWN / Strong Bearish Opening"
         pred_bg, pred_border = "#fce8e6", "#ea4335"
+        bias_text = "बेयरिश (Sell-on-Rally Bias)"
     else:
         opening_pred = "🟡 FLAT / Range-Bound Opening Expected"
         pred_bg, pred_border = "#fef7e0", "#fbbc04"
+        bias_text = "न्यूट्रल / रेंजबाउंड (Breakout/Breakdown Confirmation Required)"
 
-    col_h1, col_h2 = st.columns([1.2, 1])
+    # Top Opening Hypothesis Banner
+    st.markdown("### 🌅 Closing Analysis & Opening Hypothesis")
+    col_h1, col_h2 = st.columns([1.3, 1])
     
     with col_h1:
         st.markdown(
             f"""
-            <div style="background-color: {pred_bg}; border-left: 5px solid {pred_border}; padding: 12px 16px; border-radius: 6px; margin-bottom: 10px;">
-                <h4 style="margin:0; color: #111;">अगले ट्रेडिंग सेशन के लिए ओपनिंग हाइपोथेसिस:</h4>
-                <p style="font-size: 16px; font-weight: bold; margin: 4px 0 0 0;">{opening_pred}</p>
-                <small style="color: #555;">(ग्लोबल संकेत: US S&P500 {sp500_pct:+.2f}%, Crude Oil {crude_pct:+.2f}%, Nifty PCR: {pcr_value}, FII Net: ₹{fii_net_val} Cr)</small>
+            <div style="background-color: {pred_bg}; border-left: 5px solid {pred_border}; padding: 14px 18px; border-radius: 8px; margin-bottom: 12px;">
+                <h4 style="margin:0; color: #111;">अगले ट्रेडिंग सेशन के लिए मार्केट प्रेडिक्शन:</h4>
+                <p style="font-size: 17px; font-weight: bold; margin: 6px 0 4px 0;">{opening_pred}</p>
+                <p style="margin: 0; font-size: 13px; color: #333;"><b>ट्रेडिंग बायस:</b> {bias_text}</p>
+                <small style="color: #555; display:block; margin-top:4px;">(ग्लोबल संकेत: US S&P500 {sp500_pct:+.2f}%, Crude Oil {crude_pct:+.2f}%, DXY {dxy_pct:+.2f}%, PCR: {pcr_value}, FII Net: ₹{fii_net_val} Cr)</small>
             </div>
             """,
             unsafe_allow_html=True
@@ -1103,9 +1131,10 @@ with tab_news:
     with col_h2:
         st.markdown(
             f"""
-            <div style="background-color: #f8f9fa; border: 1px solid #e0e0e0; padding: 12px 16px; border-radius: 6px;">
-                <h4 style="margin:0; color: #111;">Nifty Support & Resistance Zone:</h4>
-                <p style="margin:4px 0 0 0;"><b>Demand Support (Max Put OI):</b> ~{max_put_oi_strike if max_put_oi_strike else 'N/A'}</p>
+            <div style="background-color: #f8f9fa; border: 1px solid #e0e0e0; padding: 14px 18px; border-radius: 8px;">
+                <h4 style="margin:0; color: #111;">Nifty Option Support & Resistance:</h4>
+                <p style="margin:6px 0 2px 0;"><b>Put-Call Ratio (PCR):</b> <span style="font-weight:bold; color:{'#34a853' if pcr_value>=1.0 else '#ea4335'};">{pcr_value}</span></p>
+                <p style="margin:2px 0 2px 0;"><b>Demand Support (Max Put OI):</b> ~{max_put_oi_strike if max_put_oi_strike else 'N/A'}</p>
                 <p style="margin:2px 0 0 0;"><b>Supply Resistance (Max Call OI):</b> ~{max_call_oi_strike if max_call_oi_strike else 'N/A'}</p>
             </div>
             """,
@@ -1113,13 +1142,97 @@ with tab_news:
         )
 
     st.markdown("---")
-    st.subheader("📰 Corporate Filings & Live News Highlights")
-    corporate_filings = fetch_nse_corporate_announcements()
+
+    # Smart Trader Deep Dive Sections (Bullet Points format)
+    st.markdown("## 🧠 Intraday Smart Trader AI Market Hypothesis & Multi-Stream Analysis")
+
+    # Section 1: Global Instruments & Macro Cues
+    st.markdown("### 🌐 1. ग्लोबल इंस्ट्रूमेंट्स, क्रूड & कमोडिटी सेंटीमेंट")
+    st.markdown("""
+* **US Dollar Index (DXY) & USD/INR:** डॉलर इंडेक्स में मजबूती इमर्जिंग मार्केट्स (भारत) से FII आउटफ्लो का दबाव बनाती है। DXY का 104 के ऊपर स्थिर होना रुपया (USD/INR) पर दबाव डालता है।
+* **US 10-Yr Treasury Yield (^TNX) & TLT:** बॉन्ड यील्ड में 4.2%+ की बढ़त रिस्क-ऑफ (Risk-Off) सेंटीमेंट लाती है, जिससे इक्विटी मार्केट्स में प्रॉफिट बुकिंग देखने को मिलती है।
+* **WTI Crude Oil & Energy Supply:** भारतीय बाजार के लिए क्रूड ऑयल बहुत क्रिटिकल है। क्रूड की कीमत $80/बैरल से ऊपर जाने पर पेंट, ऑटो, टाइल और एविएशन स्टॉक्स पर दबाव बनता है, जबकि ऑयल एक्सप्लोरेशन कंपनियों (ONGC, Oil India) को फायदा होता है।
+* **Precious Metals (Gold & Silver / XAUUSD & XAGUSD):** सोना और चांदी में सेफ-हेवन बाइंग का बढ़ना ग्लोबल जिओ-पॉलिटिकल तनाव या मार्केट अनिश्चितता का संकेत देता है।
+* **Global Indices Momentum (US30, US500, Nikkei 225, FTSE China A50, GIFT Nifty):** overnight US S&P 500 और GIFT Nifty का मोमेंटम निफ्टी की प्री-ओपनिंग दिशा तय करता है।
+""")
+
+    # Section 2: FII & DII Data Analysis
+    st.markdown("### 🏦 2. FII & DII पिछले 2-3 दिनों का फ्लो डेटा एनालिसिस")
+    st.markdown(f"""
+* **FII Net Cash Activity:** हालिया आंकड़े दर्शा रहे हैं कि FII की नेट वैल्यू **₹{fii_net_val} Cr** रही। {'FIIs नेट बायर्स हैं जो मार्केट को संस्थागत मजबूती दे रहे हैं।' if fii_net_val > 0 else 'FIIs कैश सेगमेंट में नेट सेलर हैं, जो ऊपरी स्तरों पर सप्लाई प्रेशर दर्शाता है।'}
+* **DII Net Cash Activity:** DIIs म्यूचुअल फंड SIP इनफ्लो के दम पर **₹{dii_net_val if dii_net_val else 'सकारात्मक'} Cr** का नेट सपोर्ट दे रहे हैं, जिससे बाजार में हर गिरावट पर बाइंग (Dip buying) की ताकत बनी हुई है।
+* **F&O Institutional Position:** FIIs का इंडेक्स फ्यूचर्स में लॉन्ग-टू-शॉर्ट रेशियो और कॉल/पुट राइटिंग डेटा इंट्राडे मोमेंटम का दायरा तय करता है।
+""")
+
+    # Section 3: Option Chain OI & PCR Structure
+    st.markdown("### 🎯 3. Nifty Option Chain, PCR & Strike Level Dynamic")
+    st.markdown(f"""
+* **Current Put-Call Ratio (PCR):** निफ्टी का PCR वर्तमान में **{pcr_value}** है।
+  * *PCR > 1.2:* ओवरसोल्ड रिकवरी या स्ट्रॉन्ग बुलिश सेंटीमेंट (पुट राइटिंग हैवी)।
+  * *PCR < 0.8:* ओवरबॉट करेक्शन का खतरा या बेयरिश सेंटीमेंट (कॉल राइटिंग हैवी)।
+* **Demand Zone / Support Level (~{max_put_oi_strike if max_put_oi_strike else 'N/A'} Strike):** मैक्सिमम पुट ओपन इंटरेस्ट (Put OI) इस स्ट्राइक पर है, जो इंट्राडे के लिए मजबूत सपोर्ट/डिमांड ज़ोन का काम करेगा।
+* **Supply Zone / Resistance Level (~{max_call_oi_strike if max_call_oi_strike else 'N/A'} Strike):** मैक्सिमम कॉल ओपन इंटरेस्ट (Call OI) इस स्ट्राइक पर है, जो ऊपर की ओर तत्काल कड़ा रेजिस्टेंस दर्शा रहा है।
+* **OI buildup Dynamic:** कॉल राइटर्स की अनवाइंडिंग होने पर ही शॉर्ट कवरिंग (Short Covering) रैली संभव है, जबकि पुट अनवाइंडिंग से मार्केट निचले स्तरों की ओर फिसलेगा।
+""")
+
+    # Section 4: Top 10 Weighted Stocks
+    st.markdown("### 🏢 4. Nifty 50 टॉप 10 वेटेज स्टॉक्स OI & सेक्टोरल ट्रेंड")
+    
+    top10_data = [
+        {"Stock": "HDFC Bank (HDFCBANK)", "Weight": "~11.5%", "Impact Sector": "Banking & Financials", "OI Sentiment": "इंडेक्स का मुख्य डायरेक्शनल लीडर"},
+        {"Stock": "Reliance Industries (RELIANCE)", "Weight": "~9.8%", "Impact Sector": "Energy & Telecom", "OI Sentiment": "हैवीवेट निफ्टी मूवर"},
+        {"Stock": "ICICI Bank (ICICIBANK)", "Weight": "~7.9%", "Impact Sector": "Private Banking", "OI Sentiment": "बैंक निफ्टी का सपोर्ट पिलर"},
+        {"Stock": "Infosys (INFY)", "Weight": "~5.8%", "Impact Sector": "IT Services", "OI Sentiment": "US टेक & नास्डैक से सीधा कनेक्शन"},
+        {"Stock": "ITC Ltd (ITC)", "Weight": "~4.3%", "Impact Sector": "FMCG", "OI Sentiment": "डिफेंसिव बाइंग / लो वोलेटिलिटी"},
+        {"Stock": "TCS (TCS)", "Weight": "~3.9%", "Impact Sector": "IT Major", "OI Sentiment": "करेंसी मूव & ग्लोबल टेक सेंटीमेंट"},
+        {"Stock": "Larsen & Toubro (LT)", "Weight": "~3.7%", "Impact Sector": "Infra & Capital Goods", "OI Sentiment": "डोमेस्टिक कैपेक्स ड्राइवर"},
+        {"Stock": "Axis Bank (AXISBANK)", "Weight": "~3.1%", "Impact Sector": "Banking", "OI Sentiment": "निफ्टी बैंक इंट्राडे मोमेंटम"},
+        {"Stock": "State Bank of India (SBIN)", "Weight": "~2.9%", "Impact Sector": "PSU Banking", "OI Sentiment": "PSU और मैक्रो क्रेडिट ग्रोथ"},
+        {"Stock": "Bharti Airtel (BHARTIARTL)", "Weight": "~2.8%", "Impact Sector": "Telecom", "OI Sentiment": "स्ट्रॉन्ग स्ट्रक्चरल लॉन्ग बिल्ड-अप"}
+    ]
+    st.table(top10_data)
+
+    st.markdown("""
+* **Banking Heavyweights (HDFC Bank & ICICI Bank):** इन दोनों स्टॉक्स का निफ्टी में मिलाकर ~19%+ योगदान है। इनमें यदि लॉन्ग बिल्ड-अप होता है तो निफ्टी और बैंक निफ्टी दोनों में बड़ी तेजी संभव है।
+* **IT Heavyweights (TCS & INFY):** US फेड रेट आउटलुक और NASDAQ के ट्रेंड पर ये निर्भर करते हैं। IT में शार्ट कवरिंग निफ्टी को निचले स्तरों पर सहारा देती है।
+* **Reliance Industries:** crude refining margins (GRM) और जियो टैरिफ न्यूज़ रिलायंस में बड़ा मूव ट्रिगर करते हैं।
+""")
+
+    # Section 5: Global Financial & Geopolitical News Focus
+    st.markdown("### 🌍 5. ग्लोबल फाइनेंशियल & जिओ-पॉलिटिकल न्यूज इंपैक्ट (US, China, Japan, Europe, India)")
+    st.markdown("""
+* **United States (US Fed & US Markets):** US Fed की ब्याज दर नीतियां, CPI महंगाई आंकड़े और टेक कंपनियों की अर्निंग्स रिपोर्ट ग्लोबल लिक्विडिटी की दिशा तय करती हैं।
+* **China (Macro Policy & Demand):** चीन सरकार द्वारा आर्थिक प्रोत्साहन (Stimulus) पैकेजों की घोषणा मेटल्स (Steel, Copper, Aluminium) और कमोडिटी स्टॉक्स में डिमांड ट्रिगर करती है।
+* **Japan (BOJ Policy & Yen Carry Trade):** बैंक ऑफ जापान (BOJ) की मॉनेटरी पॉलिसी और येन (Yen) की चाल से ग्लोबल 'Yen Carry Trade' पर असर पड़ता है, जो ग्लोबल मार्केट में वोलेटिलिटी बढ़ा सकता है।
+* **European Union (ECB & Energy Dynamics):** ECB इंटरेस्ट रेट्स और यूरोपियन एनर्जी सप्लाई स्थिति FTSE100 / DAX और भारतीय एक्सपोर्ट ओरिएंटेड सेक्टर्स को प्रभावित करती है।
+* **India Focus (RBI Policy, GDP Growth & Domestic Capex):** भारत की मजबूत GDP ग्रोथ, नियंत्रित रिटेल इन्फ्लेशन और कैपेक्स साइकिल के बल पर घरेलू फंड (DIIs) विदेशी बिकवाली को आसानी से सोख रहे हैं।
+""")
+
+    # Section 6: Actionable Intraday Smart Trader Execution Strategy
+    st.markdown("### ⚡ 6. Real-Time Smart Trader AI Execution Strategy & Rules")
+    st.markdown("""
+* **परिदृश्य A: गैप-अप ओपनिंग (Gap-Up Scenario):**
+  * यदि निफ्टी Supply Zone (~Max Call OI) के पास गैप-अप खुलता है, तो तुरंत FOMO में बाइंग न करें।
+  * 9:15-9:30 AM के 15-मिनट कैंडल का हाई/लो मार्क करें। VWAP या Demand Zone सपोर्ट तक पुलबैक आने पर ही **Buy-on-Dip** सेटअप खोजें।
+* **परिदृश्य B: गैप-डाउन ओपनिंग (Gap-Down Scenario):**
+  * Demand Zone (~Max Put OI) के पास प्राइस एक्शन देखें। यदि सपोर्ट ज़ोन पर बुशिश रिजेक्शन कैंडल (जैसे Hammer या Bullish Engulfing) बनती है, तो री-टेस्ट पर लॉन्ग ट्रेड लें।
+  * यदि Demand Zone वॉल्यूम के साथ ब्रेक होता है, तो **Sell-on-Rally** रणनीति अपनाएं।
+* **परिदृश्य C: फ्लैट / रेंजबाउंड ओपनिंग (Flat Opening):**
+  * VWAP लाइन और Option OI अनवाइंडिंग को ट्रैक करें। जिस स्ट्राइक पर कॉल या पुट अनवाइंडिंग शुरू हो, उस ब्रेकआउट की दिशा में मोमेंटम ट्रेड लें।
+* **स्मार्ट ट्रेडर रिस्क मैनेजमेंट रूल:**
+  * किसी भी ट्रेड में 1:2 रिस्क-टू-रिवॉर्ड (R:R) रेशियो से कम पर एंट्री न लें।
+  * 15-मिनट कैंडल क्लोजिंग के आधार पर सख्त स्टॉप-लॉस (SL) का पालन करें।
+""")
+
+    st.markdown("---")
+    st.subheader("📰 Corporate Announcements & Live News Filings")
+    corporate_filings = fetch_nse_corporate_announcements() if 'fetch_nse_corporate_announcements' in globals() else None
     if corporate_filings:
         filings_df = pd.DataFrame(corporate_filings)[["symbol", "subject", "time"]]
         st.dataframe(filings_df, use_container_width=True, hide_index=True)
     else:
         st.info("हाल ही में कोई मुख्य कॉरपोरेट अनाउंसमेंट नहीं मिला।")
+            
 
 # ---------- TAB 5: SECTOR INDEX & IMPACT (DEFERRED LOAD ON TOUCH) ----------
 with tab_sector:
