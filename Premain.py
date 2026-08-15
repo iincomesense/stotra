@@ -1,5 +1,5 @@
 """
-Full Market Dashboard (Streamlit) — Ultra-Fast & Institutional D&S Edition
+Full Market Dashboard (Streamlit) — High-Performance Ultra-Fast Edition
 ==========================================================================
 Global Markets + TradingView charts | Sector Index Impact | Stock
 Watchlist with live-flash news | Institutional D&S Zones / EMA / Volume / RSI Signals + Alerts |
@@ -13,7 +13,7 @@ import io
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,7 @@ except ImportError:
 import streamlit.components.v1 as components
 
 # ==========================================
-# 1. INSTITUTIONAL D&S CONFIGURATION
+# 1. INSTITUTIONAL D&S CONFIGURATION (UNCHANGED)
 # ==========================================
 TARGET_RR = 5.0
 SL_BUFFER_ATR = 0.1
@@ -54,23 +54,27 @@ MIN_PROXIMITY_PCT = 0.005  # 0.5%
 MAX_PROXIMITY_PCT = 0.010  # 1.0%
 
 # ==========================================
-# 2. HELPER CALCULATIONS (ATR, SWINGS & D&S ZONES)
+# 2. VECTORIZED NUMPY CALCULATIONS (PURE C-SPEED)
 # ==========================================
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates True Range and RMA-smoothed ATR matching ta.atr"""
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift(1)).abs()
-    low_close = (df['Low'] - df['Close'].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+def calculate_atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculates True Range and RMA-smoothed ATR using Pure NumPy (No Pandas Overhead)"""
+    n = len(high)
+    if n < 2:
+        return np.zeros(n)
+    tr = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+    tr = np.insert(tr, 0, high[0] - low[0])
+    
+    atr = np.empty(n, dtype=np.float64)
+    atr[0] = tr[0]
+    alpha = 1.0 / period
+    one_minus_alpha = 1.0 - alpha
+    for i in range(1, n):
+        atr[i] = alpha * tr[i] + one_minus_alpha * atr[i-1]
     return atr
 
-def calculate_pivots(df: pd.DataFrame, left: int = 5, right: int = 5):
-    """Calculates Pivot Highs & Lows matching ta.pivothigh / ta.pivotlow"""
-    highs = df['High'].values
-    lows = df['Low'].values
-    n = len(df)
-    
+def calculate_pivots_np(highs: np.ndarray, lows: np.ndarray, left: int = 5, right: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculates Pivot Highs & Lows using NumPy Arrays"""
+    n = len(highs)
     pivot_highs = np.full(n, np.nan)
     pivot_lows = np.full(n, np.nan)
     
@@ -83,7 +87,7 @@ def calculate_pivots(df: pd.DataFrame, left: int = 5, right: int = 5):
         if lows[i] == np.min(window_lows) and np.sum(window_lows == lows[i]) == 1:
             pivot_lows[i] = lows[i]
             
-    return pd.Series(pivot_highs, index=df.index), pd.Series(pivot_lows, index=df.index)
+    return pivot_highs, pivot_lows
 
 class Zone:
     def __init__(self, prox_val, dist_val, sl_val, tp_val, is_demand, is_hq, density_score, start_idx):
@@ -98,22 +102,28 @@ class Zone:
         self.start_idx = start_idx
 
 def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
-    """Pine Script Version 6 D&S Engine in Python"""
-    df = df.copy().reset_index(drop=True)
-    n = len(df)
-    if n < 30:
+    """Pine Script Version 6 D&S Engine — High-Speed NumPy Vectorized Edition"""
+    if df is None or len(df) < 30:
         return []
 
-    df['ATR'] = calculate_atr(df, ATR_PERIOD)
-    pivot_h, pivot_l = calculate_pivots(df, 5, 5)
+    # Extract pure 1D NumPy arrays to eliminate Pandas .iloc overhead
+    high = df['High'].to_numpy(dtype=np.float64)
+    low = df['Low'].to_numpy(dtype=np.float64)
+    close = df['Close'].to_numpy(dtype=np.float64)
+    open_p = df['Open'].to_numpy(dtype=np.float64)
+    volume = df['Volume'].to_numpy(dtype=np.float64)
+    n = len(high)
+
+    atr = calculate_atr_np(high, low, close, ATR_PERIOD)
+    pivot_h, pivot_l = calculate_pivots_np(high, low, 5, 5)
     
-    tr = df['High'] - df['Low']
-    is_bull = df['Close'] > df['Open']
-    is_bear = df['Open'] > df['Close']
+    tr = high - low
+    is_bull = close > open_p
+    is_bear = open_p > close
     
-    body_max = np.maximum(df['Open'], df['Close'])
-    body_min = np.minimum(df['Open'], df['Close'])
-    wicks = (df['High'] - body_max) + (body_min - df['Low'])
+    body_max = np.maximum(open_p, close)
+    body_min = np.minimum(open_p, close)
+    wicks = (high - body_max) + (body_min - low)
     wick_pct = np.where(tr == 0, 0.0, wicks / tr)
     
     all_zones: List[Zone] = []
@@ -121,10 +131,10 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
     last_swing_low = np.nan
     
     for i in range(15, n):
-        if not np.isnan(pivot_h.iloc[i]):
-            last_swing_high = pivot_h.iloc[i]
-        if not np.isnan(pivot_l.iloc[i]):
-            last_swing_low = pivot_l.iloc[i]
+        if not np.isnan(pivot_h[i]):
+            last_swing_high = pivot_h[i]
+        if not np.isnan(pivot_l[i]):
+            last_swing_low = pivot_l[i]
             
         zone_found = False
         
@@ -138,66 +148,59 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
             if leg_in_idx < 0:
                 continue
                 
-            leg_out_tr = tr.iloc[leg_out_idx]
-            leg_in_tr = tr.iloc[leg_in_idx]
-            leg_out_atr = df['ATR'].iloc[leg_out_idx]
-            leg_in_atr = df['ATR'].iloc[leg_in_idx]
+            leg_out_tr = tr[leg_out_idx]
+            leg_in_tr = tr[leg_in_idx]
+            leg_out_atr = atr[leg_out_idx]
+            leg_in_atr = atr[leg_in_idx]
             
             valid_leg_in = True
             if REQ_LEG_IN_VOL:
-                valid_leg_in = (df['Volume'].iloc[leg_in_idx] >= df['Volume'].iloc[leg_in_idx - 1] * 0.8) and \
+                valid_leg_in = (volume[leg_in_idx] >= volume[leg_in_idx - 1] * 0.8) and \
                                (leg_in_tr >= 0.8 * leg_in_atr)
                                
-            passes_volume = df['Volume'].iloc[leg_out_idx] > df['Volume'].iloc[leg_in_idx]
+            passes_volume = volume[leg_out_idx] > volume[leg_in_idx]
             is_leg_out_explosive = leg_out_tr >= (LEG_OUT_ATR_MULT * leg_out_atr)
             is_leg_out_wick_valid = wick_pct[leg_out_idx] <= MAX_WICK_PCT
             
-            is_demand_leg_out = is_bull.iloc[leg_out_idx]
-            is_supply_leg_out = is_bear.iloc[leg_out_idx]
+            is_demand_leg_out = is_bull[leg_out_idx]
+            is_supply_leg_out = is_bear[leg_out_idx]
             
-            all_base_valid = True
-            max_base_tr = 0.0
-            max_base_high = -1.0
-            min_base_low = 9999999.0
-            
-            for b in range(leg_in_idx + 1, leg_out_idx):
-                b_tr = tr.iloc[b]
-                b_atr = df['ATR'].iloc[b]
-                
-                if b_tr > max_base_tr:
-                    max_base_tr = b_tr
-                if b_tr > (MAX_BASE_ATR_MULT * b_atr):
-                    all_base_valid = False
-                if df['High'].iloc[b] > max_base_high:
-                    max_base_high = df['High'].iloc[b]
-                if df['Low'].iloc[b] < min_base_low:
-                    min_base_low = df['Low'].iloc[b]
+            base_tr_slice = tr[leg_in_idx + 1 : leg_out_idx]
+            base_atr_slice = atr[leg_in_idx + 1 : leg_out_idx]
+            base_high_slice = high[leg_in_idx + 1 : leg_out_idx]
+            base_low_slice = low[leg_in_idx + 1 : leg_out_idx]
+
+            max_base_tr = np.max(base_tr_slice)
+            max_base_high = np.max(base_high_slice)
+            min_base_low = np.min(base_low_slice)
+
+            all_base_valid = np.all(base_tr_slice <= (MAX_BASE_ATR_MULT * base_atr_slice))
                     
             passes_tr_hierarchy = (leg_out_tr > leg_in_tr) and (leg_in_tr > max_base_tr)
             
-            is_rbr = is_bull.iloc[leg_in_idx] and is_demand_leg_out
-            is_dbr = is_bear.iloc[leg_in_idx] and is_demand_leg_out
-            is_dbd = is_bear.iloc[leg_in_idx] and is_supply_leg_out
-            is_rbd = is_bull.iloc[leg_in_idx] and is_supply_leg_out
+            is_rbr = is_bull[leg_in_idx] and is_demand_leg_out
+            is_dbr = is_bear[leg_in_idx] and is_demand_leg_out
+            is_dbd = is_bear[leg_in_idx] and is_supply_leg_out
+            is_rbd = is_bull[leg_in_idx] and is_supply_leg_out
             
             has_bos = False
             if is_demand_leg_out:
-                has_bos = df['Close'].iloc[leg_out_idx] > max(df['High'].iloc[leg_in_idx], max_base_high)
+                has_bos = close[leg_out_idx] > max(high[leg_in_idx], max_base_high)
             elif is_supply_leg_out:
-                has_bos = df['Close'].iloc[leg_out_idx] < min(df['Low'].iloc[leg_in_idx], min_base_low)
+                has_bos = close[leg_out_idx] < min(low[leg_in_idx], min_base_low)
                 
             has_imbalance = True
             if USE_IMBALANCE:
                 if is_demand_leg_out:
-                    has_imbalance = (df['Low'].iloc[leg_out_idx] > max_base_high) or (df['Close'].iloc[leg_out_idx] > df['High'].iloc[leg_in_idx])
+                    has_imbalance = (low[leg_out_idx] > max_base_high) or (close[leg_out_idx] > high[leg_in_idx])
                 elif is_supply_leg_out:
-                    has_imbalance = (df['High'].iloc[leg_out_idx] < min_base_low) or (df['Close'].iloc[leg_out_idx] < df['Low'].iloc[leg_in_idx])
+                    has_imbalance = (high[leg_out_idx] < min_base_low) or (close[leg_out_idx] < low[leg_in_idx])
                     
             swept_liquidity = False
             if is_demand_leg_out and not np.isnan(last_swing_low):
-                swept_liquidity = (min_base_low < last_swing_low) or (df['Low'].iloc[leg_in_idx] < last_swing_low)
+                swept_liquidity = (min_base_low < last_swing_low) or (low[leg_in_idx] < last_swing_low)
             elif is_supply_leg_out and not np.isnan(last_swing_high):
-                swept_liquidity = (max_base_high > last_swing_high) or (df['High'].iloc[leg_in_idx] > last_swing_high)
+                swept_liquidity = (max_base_high > last_swing_high) or (high[leg_in_idx] > last_swing_high)
                 
             passes_sweep_check = swept_liquidity if USE_SWEEP_FILTER else True
             
@@ -213,7 +216,7 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
                     density_score += 25
                 if swept_liquidity:
                     density_score += 25
-                if base_count <= 2 and max_base_tr <= 0.7 * df['ATR'].iloc[i-1]:
+                if base_count <= 2 and max_base_tr <= 0.7 * atr[i-1]:
                     density_score += 25
                     
                 is_hq = density_score >= 75
@@ -221,7 +224,7 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
                 prox_val = max_base_high if is_demand_leg_out else min_base_low
                 dist_val = min_base_low if is_demand_leg_out else max_base_high
                 
-                curr_atr = df['ATR'].iloc[i]
+                curr_atr = atr[i]
                 sl_val = (dist_val - (SL_BUFFER_ATR * curr_atr)) if is_demand_leg_out else (dist_val + (SL_BUFFER_ATR * curr_atr))
                 risk_per_share = abs(prox_val - sl_val)
                 tp_val = (prox_val + (risk_per_share * TARGET_RR)) if is_demand_leg_out else (prox_val - (risk_per_share * TARGET_RR))
@@ -235,8 +238,8 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
                 if not is_duplicate:
                     all_zones.append(Zone(prox_val, dist_val, sl_val, tp_val, is_demand_leg_out, is_hq, density_score, i))
                     
-        curr_high = df['High'].iloc[i]
-        curr_low = df['Low'].iloc[i]
+        curr_high = high[i]
+        curr_low = low[i]
         
         for z in all_zones:
             if z.state == "Broken":
@@ -271,7 +274,7 @@ NEWS_WINDOW_START = dtime(8, 30)
 NEWS_WINDOW_END = dtime(20, 30)    
 
 COLOR_POS_BG, COLOR_POS_TEXT = "#d4f8d4", "#0a7d2f"
-COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8d4d4", "#c0392b"
+COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8f8d4", "#c0392b"
 COLOR_FLAT_TEXT = "#555555"
 COLOR_SPIKE_BG = "#ffe1a8"   
 
@@ -324,16 +327,6 @@ SECTOR_INDEX_TICKERS = {
     "Nifty Energy": "^CNXENERGY", "Nifty Realty": "^CNXREALTY",
     "Nifty PSU Bank": "^CNXPSUBANK", "Nifty Financial Services": "^CNXFIN",
 }
-
-POSITIVE_WORDS = ["surge", "rally", "jump", "gain", "upgrade", "record profit",
-                   "order win", "bags order", "beats estimate", "buyback",
-                   "strong results", "upper circuit", "bullish", "outperform"]
-NEGATIVE_WORDS = ["crash", "plunge", "fall", "downgrade", "miss estimate",
-                   "loss", "lower circuit", "bearish", "underperform",
-                   "probe", "raid", "fraud", "default", "resign"]
-HIGH_IMPACT_WORDS = ["rbi", "sebi", "fed", "war", "ban", "sanction",
-                      "interest rate", "inflation", "gdp", "election",
-                      "recession", "crisis", "circuit breaker"]
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -463,38 +456,58 @@ TIMEFRAMES = {
     "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
 }
 
-def check_ema_cross(df):
-    if len(df) < 50: return None
-    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
-    if ema20.iloc[-2] <= ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]:
+def check_ema_cross_fast(close: np.ndarray):
+    """NumPy Optimized EMA 20/50 Crossover Check"""
+    if len(close) < 50: return None
+    
+    def calc_ema(arr, span):
+        alpha = 2.0 / (span + 1.0)
+        res = np.empty_like(arr)
+        res[0] = arr[0]
+        one_minus_alpha = 1.0 - alpha
+        for i in range(1, len(arr)):
+            res[i] = alpha * arr[i] + one_minus_alpha * res[i-1]
+        return res
+
+    ema20 = calc_ema(close, 20)
+    ema50 = calc_ema(close, 50)
+    if ema20[-2] <= ema50[-2] and ema20[-1] > ema50[-1]:
         return "🟢 EMA UP"
-    if ema20.iloc[-2] >= ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]:
+    if ema20[-2] >= ema50[-2] and ema20[-1] < ema50[-1]:
         return "🔴 EMA DOWN"
     return None
 
-def check_volume_spike(df, mult=2.0):
-    vol = df["Volume"]
+def check_volume_spike_fast(vol: np.ndarray, mult=2.0):
+    """NumPy Optimized Volume Spike Check"""
     if len(vol) < 21: return None
-    avg_vol = vol.iloc[-21:-1].mean()
-    curr_vol = vol.iloc[-1]
+    avg_vol = np.mean(vol[-21:-1])
+    curr_vol = vol[-1]
     if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
         return f"⚡ Vol {curr_vol / avg_vol:.1f}x"
     return None
 
-def check_rsi(df, period=14):
-    if len(df) < period + 1: return None
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    last_rsi = rsi.iloc[-1]
-    if last_rsi >= 70: return f"🔥 RSI OB ({last_rsi:.0f})"
-    if last_rsi <= 30: return f"🧊 RSI OS ({last_rsi:.0f})"
+def check_rsi_fast(close: np.ndarray, period=14):
+    """NumPy Optimized RSI Check"""
+    if len(close) < period + 1: return None
+    diffs = np.diff(close)
+    gains = np.where(diffs > 0, diffs, 0.0)
+    losses = np.where(diffs < 0, -diffs, 0.0)
+    
+    if len(gains) < period: return None
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        
+    if rsi >= 70: return f"🔥 RSI OB ({rsi:.0f})"
+    if rsi <= 30: return f"🧊 RSI OS ({rsi:.0f})"
     return None
 
-def check_ds_zones(df):
+def check_ds_zones(df: pd.DataFrame):
     """Institutional Demand & Supply Proximity Alert Check"""
     zones = scan_institutional_ds_zones(df)
     if not zones:
@@ -576,64 +589,55 @@ def maybe_clear_alerts():
 
 maybe_clear_alerts()
 
-# ============================== QUOTE FETCH HELPERS ==============================
-@st.cache_data(ttl=300, show_spinner=False)
-def batch_daily(tickers_tuple):
-    tickers = list(tickers_tuple)
-    if not tickers: return {}
-    try:
-        data = yf.download(tickers, period="10d", interval="1d", group_by="ticker", progress=False, threads=True)
-    except Exception: return {}
-    out = {}
-    for t in tickers:
-        try:
-            df = data[t].dropna() if len(tickers) > 1 else data.dropna()
-            if len(df) >= 2:
-                last, prev = df["Close"].iloc[-1], df["Close"].iloc[-2]
-                out[t] = {"price": last, "pct": (last - prev) / prev * 100, "chg": last - prev}
-        except Exception: continue
-    return out
-
+# ============================== UNIFIED SINGLE DOWNLOAD ENGINE ==============================
 @st.cache_data(ttl=180, show_spinner=False)
-def batch_intraday_last(tickers_tuple):
+def unified_yf_download_engine(tickers_tuple: Tuple[str, ...], period: str = "10d", interval: str = "1d") -> Dict[str, pd.DataFrame]:
+    """Unified Single Batch Download Engine for all YFinance Requests"""
     tickers = list(tickers_tuple)
     if not tickers: return {}
     try:
-        data = yf.download(tickers, period="1d", interval="5m", group_by="ticker", progress=False, threads=True)
+        data = yf.download(tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
     except Exception: return {}
+    
     out = {}
     for t in tickers:
         try:
             df = data[t].dropna() if len(tickers) > 1 else data.dropna()
-            if len(df): out[t] = df["Close"].iloc[-1]
+            if not df.empty:
+                out[t] = df
         except Exception: continue
     return out
 
-def get_quotes(tickers):
-    daily = batch_daily(tuple(tickers))
-    intraday = batch_intraday_last(tuple(tickers))
+def get_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetches Live and Daily Quotes using Unified Download Engine"""
+    daily_data = unified_yf_download_engine(tuple(tickers), period="10d", interval="1d")
+    intraday_data = unified_yf_download_engine(tuple(tickers), period="1d", interval="5m")
+    
     quotes = {}
     for t in tickers:
-        d = daily.get(t)
-        if not d: continue
-        quotes[t] = {"price": intraday.get(t, d["price"]), "pct": d["pct"], "chg": d.get("chg")}
+        df_d = daily_data.get(t)
+        if df_d is None or len(df_d) < 2: continue
+        last, prev = df_d["Close"].iloc[-1], df_d["Close"].iloc[-2]
+        chg = last - prev
+        pct = (chg / prev) * 100
+        
+        df_intra = intraday_data.get(t)
+        live_price = df_intra["Close"].iloc[-1] if df_intra is not None and len(df_intra) > 0 else last
+        quotes[t] = {"price": live_price, "pct": pct, "chg": chg}
     return quotes
 
 # ============================== FAST PARALLEL TIMEFRAME SCANNER ==============================
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_tf_data_single_v2(tf_key, items_tuple):
+def fetch_tf_data_single_v2(tf_key: str, items_tuple: Tuple):
     cfg = TIMEFRAMES[tf_key]
     yf_symbols = [item[1] for item in items_tuple]
     if not yf_symbols: return {}
-    try:
-        data = yf.download(yf_symbols, period=cfg["period"], interval=cfg["interval"],
-                            group_by="ticker", progress=False, threads=True)
-    except Exception: return {}
+    
+    data = unified_yf_download_engine(tuple(yf_symbols), period=cfg["period"], interval=cfg["interval"])
     
     out = {}
     for display_name, yf_sym, tv_sym, cat in items_tuple:
-        try: df = data[yf_sym].dropna() if len(yf_symbols) > 1 else data.dropna()
-        except Exception: continue
+        df = data.get(yf_sym)
         if df is None or df.empty: continue
         if cfg["resample"]:
             df = df.resample(cfg["resample"]).agg(
@@ -774,6 +778,32 @@ def fetch_economic_event_count_today():
         return count
     except Exception: return None
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_quick_news_link_live(stock_name: str):
+    """Google News API Fetcher with High TTL (1 Hr Cache) & Lazy Load"""
+    if feedparser is None: return None
+    query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        feed = feedparser.parse(requests.get(url, timeout=8).content)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        for e in feed.entries[:5]:
+            pub = e.get("published_parsed")
+            if pub and datetime(*pub[:6], tzinfo=timezone.utc) >= cutoff:
+                return e.link
+    except Exception: pass
+    return None
+
+def fetch_news_links_parallel(stocks):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(fetch_stock_quick_news_link_live, s): s for s in stocks}
+        for fut in concurrent.futures.as_completed(futures):
+            s = futures[fut]
+            try: results[s] = fut.result()
+            except Exception: results[s] = None
+    return results
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_nse_corporate_announcements():
     data = fetch_nse_json("/api/corporate-announcements?index=equities")
@@ -790,15 +820,17 @@ def fetch_nse_corporate_announcements():
         except Exception: continue
     return items
 
-# ============================== TABS ORDER (Signals & Alerts First) ==============================
-(tab_signals, tab_alerts, tab_global, tab_sector, tab_stocks, tab_calendar,
- tab_fii, tab_delivery, tab_movers, tab_news) = st.tabs([
-    "📊 Signals", "🔔 Alerts", "🌍 Global", "🏭 Sector Impact", "📋 Watchlist",
-    "🗓️ Calendar", "💰 FII/DII+Nifty", "📦 Delivery%+Deals",
-    "🏆 Gainers/Losers", "📰 News",
+# ============================== TABS ORDER ==============================
+# Signals, Alerts, Global, News: AUTO-REFRESH ALWAYS ACTIVE
+# Sector, Watchlist, Calendar, FII/DII, Delivery, Gainers/Losers: DEFERRED EXECUTION ON TOUCH
+(tab_signals, tab_alerts, tab_global, tab_news, tab_sector, tab_stocks, 
+ tab_calendar, tab_fii, tab_delivery, tab_movers) = st.tabs([
+    "📊 Signals", "🔔 Alerts", "🌍 Global", "📰 News & AI Hypothesis", 
+    "🏭 Sector Impact", "📋 Watchlist", "🗓️ Calendar", "💰 FII/DII+Nifty", 
+    "📦 Delivery%+Deals", "🏆 Gainers/Losers"
 ])
 
-# ---------- TAB 1: FAST EMA/VOLUME/RSI & INSTITUTIONAL D&S SIGNALS ----------
+# ---------- TAB 1: FAST EMA/VOLUME/RSI & INSTITUTIONAL D&S SIGNALS (AUTO-REFRESH) ----------
 with tab_signals:
     st.subheader("📊 Institutional D&S + Technical Multi-Asset Scanner")
     
@@ -840,6 +872,10 @@ with tab_signals:
                 tv_sym = item_dict["tv"]
                 price, bar_time = df["Close"].iloc[-1], df.index[-1]
                 
+                # NumPy High-Speed Array Conversion
+                close_np = df["Close"].to_numpy(dtype=np.float64)
+                vol_np = df["Volume"].to_numpy(dtype=np.float64)
+
                 type_parts = []
                 is_daily_vol_spike = False
                 is_hq_ds_zone = False
@@ -853,19 +889,19 @@ with tab_signals:
 
                 # 2. EMA Crossover
                 if "EMA Crossover (20/50)" in selected_indicators:
-                    cross = check_ema_cross(df)
+                    cross = check_ema_cross_fast(close_np)
                     if cross: type_parts.append(cross)
 
                 # 3. Volume Spike
                 if "Volume Spike" in selected_indicators:
-                    vr = check_volume_spike(df, vol_mult)
+                    vr = check_volume_spike_fast(vol_np, vol_mult)
                     if vr:
                         type_parts.append(vr)
                         if tf_key == "Daily": is_daily_vol_spike = True
 
                 # 4. RSI
                 if "RSI (14)" in selected_indicators:
-                    rsi_sig = check_rsi(df)
+                    rsi_sig = check_rsi_fast(close_np)
                     if rsi_sig: type_parts.append(rsi_sig)
 
                 if not type_parts: continue
@@ -919,7 +955,7 @@ with tab_signals:
                 column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
             )
 
-# ---------- TAB 2: ALERTS ----------
+# ---------- TAB 2: ALERTS (AUTO-REFRESH) ----------
 with tab_alerts:
     st.subheader("🔔 Live Signal & D&S Zone Alerts")
     alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
@@ -948,7 +984,7 @@ with tab_alerts:
             st.session_state.alerts = []
             st.rerun()
 
-# ---------- TAB 3: GLOBAL MARKETS ----------
+# ---------- TAB 3: GLOBAL MARKETS (AUTO-REFRESH) ----------
 with tab_global:
     st.subheader("🌍 Global Markets")
     ticker_items = ",".join(
@@ -981,259 +1017,7 @@ with tab_global:
         column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Live Chart खोलें")},
     )
 
-# ---------- TAB 4: SECTOR INDEX & IMPACT ----------
-with tab_sector:
-    sector_quotes = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
-    sec_rows = [{"Sector Index": name, "% Chg": f"{sector_quotes[yft]['pct']:+.2f}%" if yft in sector_quotes else "—"}
-                for name, yft in SECTOR_INDEX_TICKERS.items()]
-    sec_df = pd.DataFrame(sec_rows)
-    if not sec_df.empty:
-        st.dataframe(style_pct_columns(sec_df, ["% Chg"]), use_container_width=True, hide_index=True)
-    st.caption("नोट: कुछ सेक्टर इंडेक्स टिकर Yahoo Finance पर उपलब्ध ना हों तो वहां '—' दिखेगा।")
-
-    st.markdown("---")
-    st.subheader("📌 Global + India Macro Sector Impact")
-    quotes_map = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
-    def q(yft): return quotes_map.get(yft)
-
-    impact_rows = []
-    usdinr, crude, us10y = q("INR=X"), q("CL=F"), q("^TNX")
-    copper = q("HG=F")
-
-    if usdinr and abs(usdinr["pct"]) >= 0.15:
-        it_stocks = ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "PERSISTENT"]
-        omc_stocks = ["BPCL", "IOC", "HINDPETRO"]
-        if usdinr["pct"] > 0:
-            impact_rows.append({"sector": "IT / Export", "stocks": it_stocks, "signal": "🟢 Positive",
-                                 "reason": f"रुपया {usdinr['pct']:+.2f}% कमज़ोर — export revenue का rupee-value बढ़ता है"})
-            impact_rows.append({"sector": "Oil Importers / OMC", "stocks": omc_stocks, "signal": "🔴 Negative",
-                                 "reason": "Import bill महंगा पड़ेगा"})
-        else:
-            impact_rows.append({"sector": "IT / Export", "stocks": it_stocks, "signal": "🔴 Negative",
-                                 "reason": f"रुपया {abs(usdinr['pct']):.2f}% मज़बूत — export margin पर दबाव"})
-            impact_rows.append({"sector": "Oil Importers / OMC", "stocks": omc_stocks, "signal": "🟢 Positive",
-                                 "reason": "Import cost घटेगा"})
-
-    if crude and abs(crude["pct"]) >= 0.5:
-        if crude["pct"] > 0:
-            impact_rows.append({"sector": "Upstream Oil", "stocks": ["ONGC", "OIL"], "signal": "🟢 Positive",
-                                 "reason": f"Crude {crude['pct']:+.2f}% — realisation बेहतर"})
-            impact_rows.append({"sector": "OMC / Aviation / Paints",
-                                 "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO", "ASIANPAINT"],
-                                 "signal": "🔴 Negative", "reason": "इनपुट कॉस्ट/ATF महंगा"})
-        else:
-            impact_rows.append({"sector": "OMC / Aviation", "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO"],
-                                 "signal": "🟢 Positive", "reason": f"Crude {crude['pct']:+.2f}% — इनपुट कॉस्ट घटेगा"})
-            impact_rows.append({"sector": "Upstream Oil", "stocks": ["ONGC", "OIL"], "signal": "🔴 Negative",
-                                 "reason": "Realisation घटेगा"})
-
-    if us10y and abs(us10y["pct"]) >= 1.0:
-        tag = "🔴 Negative" if us10y["pct"] > 0 else "🟢 Positive"
-        impact_rows.append({"sector": "Banks / NBFC / High-Valuation Stocks",
-                             "stocks": ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "BAJFINANCE"],
-                             "signal": tag, "reason": f"US 10Y yield {us10y['pct']:+.2f}% — FII flow पर असर"})
-
-    if copper and abs(copper["pct"]) >= 0.5:
-        tag = "🟢 Positive" if copper["pct"] > 0 else "🔴 Negative"
-        impact_rows.append({"sector": "Metals",
-                             "stocks": ["HINDALCO", "VEDL", "NATIONALUM", "TATASTEEL", "JSWSTEEL", "JINDALSTEL"],
-                             "signal": tag, "reason": f"Copper {copper['pct']:+.2f}% — base-metal sentiment"})
-
-    if not impact_rows:
-        st.info("आज कोई भी macro driver threshold से ऊपर move नहीं हुआ।")
-    else:
-        for row in impact_rows:
-            st.markdown(f"**{row['sector']}** — {row['signal']}")
-            st.caption(row["reason"])
-            if row["stocks"]:
-                st.markdown(" &nbsp;|&nbsp; ".join(f"[{s}]({tv_link(tv_symbol_for_stock(s))})" for s in row["stocks"]), unsafe_allow_html=True)
-            st.markdown("---")
-
-# ---------- TAB 5: STOCK WATCHLIST ----------
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_stock_quick_news_link_live(stock_name):
-    if feedparser is None: return None
-    query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
-    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-    try:
-        feed = feedparser.parse(requests.get(url, timeout=10).content)
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        for e in feed.entries[:5]:
-            pub = e.get("published_parsed")
-            if pub and datetime(*pub[:6], tzinfo=timezone.utc) >= cutoff:
-                return e.link
-    except Exception: pass
-    return None
-
-def fetch_news_links_parallel(stocks):
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(fetch_stock_quick_news_link_live, s): s for s in stocks}
-        for fut in concurrent.futures.as_completed(futures):
-            s = futures[fut]
-            try: results[s] = fut.result()
-            except Exception: results[s] = None
-    return results
-
-with tab_stocks:
-    flash_badge = "🔴 LIVE (मार्केट खुला)" if is_market_hours() else "⚪ मार्केट बंद"
-    st.subheader(f"📋 Stock Watchlist ({len(selected_stocks)} स्टॉक्स)")
-    st.caption(flash_badge + " · 🟢▲ = ऊपर · 🔴▼ = नीचे")
-
-    s_quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
-    with st.spinner("हर स्टॉक की ताज़ा news (24h) चेक हो रही है..."):
-        news_links = fetch_news_links_parallel(selected_stocks)
-
-    rows = []
-    for s in selected_stocks:
-        q = s_quotes.get(yf_ticker_for_stock(s))
-        rows.append({
-            "Stock": s, "LTP": f"{q['price']:.2f}" if q else "—",
-            "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—",
-            "Chart": tv_link(tv_symbol_for_stock(s)), "News (24h)": news_links.get(s),
-        })
-    sdf = pd.DataFrame(rows)
-    st.dataframe(
-        style_pct_columns(sdf, ["Change"]), use_container_width=True, hide_index=True, height=460,
-        column_config={
-            "Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें"),
-            "News (24h)": st.column_config.LinkColumn("News (24h)", display_text="📰 पढ़ें"),
-        },
-    )
-
-# ---------- TAB 6: ECONOMIC CALENDAR ----------
-with tab_calendar:
-    st.subheader("🗓️ Global + India Economic Calendar")
-    event_count = fetch_economic_event_count_today()
-    if event_count is not None:
-        st.metric("🔔 आज के Medium/High Importance Events", event_count)
-    components.html("""
-        <div class="tradingview-widget-container">
-          <div class="tradingview-widget-container__widget"></div>
-          <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
-          {"colorTheme": "light", "isTransparent": false, "width": "100%", "height": "600", "locale": "en", "importanceFilter": "0,1", "countryFilter": "us,in,cn,jp,gb,eu"}
-          </script>
-        </div>""", height=620)
-
-# ---------- TAB 7: FII/DII + NIFTY OUTLOOK ----------
-with tab_fii:
-    col_fii, col_nifty = st.columns(2)
-
-    with col_fii:
-        st.markdown("### 💰 FII / DII Activity")
-        fii_df, source = fetch_fii_dii()
-        if fii_df is not None:
-            latest_row = fii_df.iloc[0]
-            cols = st.columns(len(latest_row))
-            for i, (colname, val) in enumerate(latest_row.items()):
-                cols[i].metric(str(colname), str(val))
-
-            insight = fii_dii_insight(fii_df)
-            if insight:
-                level, msg = insight
-                getattr(st, level)(msg)
-
-            with st.expander("📅 पिछले 5 दिन का पूरा डाटा देखें"):
-                st.dataframe(fii_df, use_container_width=True, hide_index=True)
-            st.caption(f"Source: {source}")
-        else:
-            st.warning("FII/DII data उपलब्ध नहीं हो पाया।")
-
-    with col_nifty:
-        st.markdown("### 🎯 Nifty 50 — Option Chain Outlook")
-        oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
-        if oc_data:
-            try:
-                records, spot = oc_data["records"]["data"], oc_data["records"]["underlyingValue"]
-                call_oi, put_oi = {}, {}
-                for r in records:
-                    strike = r["strikePrice"]
-                    if "CE" in r: call_oi[strike] = r["CE"]["openInterest"]
-                    if "PE" in r: put_oi[strike] = r["PE"]["openInterest"]
-                total_call, total_put = sum(call_oi.values()), sum(put_oi.values())
-                pcr = round(total_put / total_call, 2) if total_call else None
-                resistance = max(call_oi, key=call_oi.get) if call_oi else None
-                support = max(put_oi, key=put_oi.get) if put_oi else None
-
-                st.metric("Nifty Spot", f"{spot:.2f}")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("PCR (OI)", pcr if pcr else "—")
-                c2.metric("Resistance", resistance if resistance else "—")
-                c3.metric("Support", support if support else "—")
-                if pcr:
-                    bias = "Mildly Bullish" if pcr > 1.1 else "Mildly Bearish" if pcr < 0.8 else "Range-bound"
-                    st.info(f"📌 **{bias}** (PCR={pcr}). Support ~{support}, Resistance ~{resistance}.")
-            except Exception:
-                st.warning("Option-chain data parse नहीं हो पाया।")
-        else:
-            st.warning("NSE Option-Chain data नहीं मिला।")
-
-# ---------- TAB 8: DELIVERY % + BULK/BLOCK DEALS ----------
-with tab_delivery:
-    st.subheader("📦 Delivery % — पिछले 2 दिन (Compare)")
-    with st.spinner("पिछले 2 दिन का delivery data देखा जा रहा है..."):
-        deliv_date, deliv_rows = get_delivery_2day_compare(selected_stocks)
-
-    if deliv_date is None or not deliv_rows:
-        st.info("Delivery data लोड नहीं हो सका या watchlist खाली है।")
-    else:
-        ddf = pd.DataFrame(deliv_rows).sort_values("बदलाव", ascending=False)
-        def hl_change(val):
-            if val > 0: return f"background-color:{COLOR_POS_BG}; color:{COLOR_POS_TEXT}; font-weight:600;"
-            if val < 0: return f"background-color:{COLOR_NEG_BG}; color:{COLOR_NEG_TEXT}; font-weight:600;"
-            return ""
-
-        styler = _styler_apply_map(ddf.style, hl_change, ["बदलाव"])
-        st.dataframe(
-            styler, use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
-        )
-
-    st.markdown("---")
-    st.subheader("🏦 Bulk / Block Deals (आपकी Watchlist में)")
-    deals_data = fetch_bulk_block_deals()
-    if deals_data:
-        bulk = filter_deals_for_watchlist(deals_data.get("BULK_DEALS_DATA", []), selected_stocks)
-        block = filter_deals_for_watchlist(deals_data.get("BLOCK_DEALS_DATA", []), selected_stocks)
-        if bulk is not None and not bulk.empty:
-            st.markdown("**Bulk Deals**")
-            st.dataframe(bulk, use_container_width=True, hide_index=True)
-        if block is not None and not block.empty:
-            st.markdown("**Block Deals**")
-            st.dataframe(block, use_container_width=True, hide_index=True)
-
-# ---------- TAB 9: TOP GAINERS / LOSERS ----------
-with tab_movers:
-    st.subheader("🏆 Top 5 Gainers & Top 5 Losers")
-    quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
-    mv_rows = []
-    for s in selected_stocks:
-        qd = quotes.get(yf_ticker_for_stock(s))
-        if qd:
-            mv_rows.append({"Stock": s, "LTP": qd["price"], "pct": qd["pct"], "chg": qd.get("chg"),
-                             "Chart": tv_link(tv_symbol_for_stock(s))})
-    mv_df = pd.DataFrame(mv_rows)
-    if not mv_df.empty:
-        gainers = mv_df.sort_values("pct", ascending=False).head(5).copy()
-        losers = mv_df.sort_values("pct", ascending=True).head(5).copy()
-        for _df in (gainers, losers):
-            _df["Change"] = _df.apply(lambda r: fmt_change(r["chg"], r["pct"]), axis=1)
-            _df.drop(columns=["pct", "chg"], inplace=True)
-
-        st.markdown("#### 🟢 Top 5 Gainers")
-        st.dataframe(
-            style_pct_columns(gainers.style.format({"LTP": "{:.2f}"}), ["Change"]),
-            use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
-        )
-        st.markdown("#### 🔴 Top 5 Losers")
-        st.dataframe(
-            style_pct_columns(losers.style.format({"LTP": "{:.2f}"}), ["Change"]),
-            use_container_width=True, hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
-        )
-
-# ---------- TAB 10: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE ----------
+# ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
     st.subheader("🧠 Real-Time AI Market Intelligence & Opening Hypothesis Engine")
     st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Demand/Supply Zones + Real-Time Signal Alerts")
@@ -1336,3 +1120,248 @@ with tab_news:
         st.dataframe(filings_df, use_container_width=True, hide_index=True)
     else:
         st.info("हाल ही में कोई मुख्य कॉरपोरेट अनाउंसमेंट नहीं मिला।")
+
+# ---------- TAB 5: SECTOR INDEX & IMPACT (DEFERRED LOAD ON TOUCH) ----------
+with tab_sector:
+    if st.button("▶️ Sector Data Load/Refresh करें", key="btn_sector"):
+        sector_quotes = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
+        sec_rows = [{"Sector Index": name, "% Chg": f"{sector_quotes[yft]['pct']:+.2f}%" if yft in sector_quotes else "—"}
+                    for name, yft in SECTOR_INDEX_TICKERS.items()]
+        sec_df = pd.DataFrame(sec_rows)
+        if not sec_df.empty:
+            st.dataframe(style_pct_columns(sec_df, ["% Chg"]), use_container_width=True, hide_index=True)
+        st.caption("नोट: कुछ सेक्टर इंडेक्स टिकर Yahoo Finance पर उपलब्ध ना हों तो वहां '—' दिखेगा।")
+
+        st.markdown("---")
+        st.subheader("📌 Global + India Macro Sector Impact")
+        quotes_map = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
+        def q(yft): return quotes_map.get(yft)
+
+        impact_rows = []
+        usdinr, crude, us10y = q("INR=X"), q("CL=F"), q("^TNX")
+        copper = q("HG=F")
+
+        if usdinr and abs(usdinr["pct"]) >= 0.15:
+            it_stocks = ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "COFORGE", "PERSISTENT"]
+            omc_stocks = ["BPCL", "IOC", "HINDPETRO"]
+            if usdinr["pct"] > 0:
+                impact_rows.append({"sector": "IT / Export", "stocks": it_stocks, "signal": "🟢 Positive",
+                                     "reason": f"रुपया {usdinr['pct']:+.2f}% कमज़ोर — export revenue का rupee-value बढ़ता है"})
+                impact_rows.append({"sector": "Oil Importers / OMC", "stocks": omc_stocks, "signal": "🔴 Negative",
+                                     "reason": "Import bill महंगा पड़ेगा"})
+            else:
+                impact_rows.append({"sector": "IT / Export", "stocks": it_stocks, "signal": "🔴 Negative",
+                                     "reason": f"रुपया {abs(usdinr['pct']):.2f}% मज़बूत — export margin पर दबाव"})
+                impact_rows.append({"sector": "Oil Importers / OMC", "stocks": omc_stocks, "signal": "🟢 Positive",
+                                     "reason": "Import cost घटेगा"})
+
+        if crude and abs(crude["pct"]) >= 0.5:
+            if crude["pct"] > 0:
+                impact_rows.append({"sector": "Upstream Oil", "stocks": ["ONGC", "OIL"], "signal": "🟢 Positive",
+                                     "reason": f"Crude {crude['pct']:+.2f}% — realisation बेहतर"})
+                impact_rows.append({"sector": "OMC / Aviation / Paints",
+                                     "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO", "ASIANPAINT"],
+                                     "signal": "🔴 Negative", "reason": "इनपुट कॉस्ट/ATF महंगा"})
+            else:
+                impact_rows.append({"sector": "OMC / Aviation", "stocks": ["BPCL", "IOC", "HINDPETRO", "INDIGO"],
+                                     "signal": "🟢 Positive", "reason": f"Crude {crude['pct']:+.2f}% — इनपुट कॉस्ट घटेगा"})
+                impact_rows.append({"sector": "Upstream Oil", "stocks": ["ONGC", "OIL"], "signal": "🔴 Negative",
+                                     "reason": "Realisation घटेगा"})
+
+        if us10y and abs(us10y["pct"]) >= 1.0:
+            tag = "🔴 Negative" if us10y["pct"] > 0 else "🟢 Positive"
+            impact_rows.append({"sector": "Banks / NBFC / High-Valuation Stocks",
+                                 "stocks": ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "BAJFINANCE"],
+                                 "signal": tag, "reason": f"US 10Y yield {us10y['pct']:+.2f}% — FII flow पर असर"})
+
+        if copper and abs(copper["pct"]) >= 0.5:
+            tag = "🟢 Positive" if copper["pct"] > 0 else "🔴 Negative"
+            impact_rows.append({"sector": "Metals",
+                                 "stocks": ["HINDALCO", "VEDL", "NATIONALUM", "TATASTEEL", "JSWSTEEL", "JINDALSTEL"],
+                                 "signal": tag, "reason": f"Copper {copper['pct']:+.2f}% — base-metal sentiment"})
+
+        if not impact_rows:
+            st.info("आज कोई भी macro driver threshold से ऊपर move नहीं हुआ।")
+        else:
+            for row in impact_rows:
+                st.markdown(f"**{row['sector']}** — {row['signal']}")
+                st.caption(row["reason"])
+                if row["stocks"]:
+                    st.markdown(" &nbsp;|&nbsp; ".join(f"[{s}]({tv_link(tv_symbol_for_stock(s))})" for s in row["stocks"]), unsafe_allow_html=True)
+                st.markdown("---")
+    else:
+        st.info("💡 डेटा लोड करने के लिए ऊपर **▶️ Sector Data Load/Refresh करें** बटन पर क्लिक करें।")
+
+# ---------- TAB 6: STOCK WATCHLIST (DEFERRED LOAD ON TOUCH) ----------
+with tab_stocks:
+    if st.button("▶️ Watchlist Load/Refresh करें", key="btn_watchlist"):
+        flash_badge = "🔴 LIVE (मार्केट खुला)" if is_market_hours() else "⚪ मार्केट बंद"
+        st.subheader(f"📋 Stock Watchlist ({len(selected_stocks)} स्टॉक्स)")
+        st.caption(flash_badge + " · 🟢▲ = ऊपर · 🔴▼ = नीचे")
+
+        s_quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
+        with st.spinner("हर स्टॉक की ताज़ा news (Cache 1hr) चेक हो रही है..."):
+            news_links = fetch_news_links_parallel(selected_stocks)
+
+        rows = []
+        for s in selected_stocks:
+            q = s_quotes.get(yf_ticker_for_stock(s))
+            rows.append({
+                "Stock": s, "LTP": f"{q['price']:.2f}" if q else "—",
+                "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—",
+                "Chart": tv_link(tv_symbol_for_stock(s)), "News (24h)": news_links.get(s),
+            })
+        sdf = pd.DataFrame(rows)
+        st.dataframe(
+            style_pct_columns(sdf, ["Change"]), use_container_width=True, hide_index=True, height=460,
+            column_config={
+                "Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें"),
+                "News (24h)": st.column_config.LinkColumn("News (24h)", display_text="📰 पढ़ें"),
+            },
+        )
+    else:
+        st.info("💡 Watchlist लोड करने के लिए ऊपर **▶️ Watchlist Load/Refresh करें** बटन पर क्लिक करें।")
+
+# ---------- TAB 7: ECONOMIC CALENDAR (DEFERRED LOAD ON TOUCH) ----------
+with tab_calendar:
+    if st.button("▶️ Calendar Load/Refresh करें", key="btn_calendar"):
+        st.subheader("🗓️ Global + India Economic Calendar")
+        event_count = fetch_economic_event_count_today()
+        if event_count is not None:
+            st.metric("🔔 आज के Medium/High Importance Events", event_count)
+        components.html("""
+            <div class="tradingview-widget-container">
+              <div class="tradingview-widget-container__widget"></div>
+              <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
+              {"colorTheme": "light", "isTransparent": false, "width": "100%", "height": "600", "locale": "en", "importanceFilter": "0,1", "countryFilter": "us,in,cn,jp,gb,eu"}
+              </script>
+            </div>""", height=620)
+    else:
+        st.info("💡 Calendar देखने के लिए ऊपर **▶️ Calendar Load/Refresh करें** बटन दबाएं।")
+
+# ---------- TAB 8: FII/DII + NIFTY OUTLOOK (DEFERRED LOAD ON TOUCH) ----------
+with tab_fii:
+    if st.button("▶️ FII/DII + Nifty Data Load करें", key="btn_fii"):
+        col_fii, col_nifty = st.columns(2)
+
+        with col_fii:
+            st.markdown("### 💰 FII / DII Activity")
+            fii_df, source = fetch_fii_dii()
+            if fii_df is not None:
+                latest_row = fii_df.iloc[0]
+                cols = st.columns(len(latest_row))
+                for i, (colname, val) in enumerate(latest_row.items()):
+                    cols[i].metric(str(colname), str(val))
+
+                insight = fii_dii_insight(fii_df)
+                if insight:
+                    level, msg = insight
+                    getattr(st, level)(msg)
+
+                with st.expander("📅 पिछले 5 दिन का पूरा डाटा देखें"):
+                    st.dataframe(fii_df, use_container_width=True, hide_index=True)
+                st.caption(f"Source: {source}")
+            else:
+                st.warning("FII/DII data उपलब्ध नहीं हो पाया।")
+
+        with col_nifty:
+            st.markdown("### 🎯 Nifty 50 — Option Chain Outlook")
+            oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+            if oc_data:
+                try:
+                    records, spot = oc_data["records"]["data"], oc_data["records"]["underlyingValue"]
+                    call_oi, put_oi = {}, {}
+                    for r in records:
+                        strike = r["strikePrice"]
+                        if "CE" in r: call_oi[strike] = r["CE"]["openInterest"]
+                        if "PE" in r: put_oi[strike] = r["PE"]["openInterest"]
+                    total_call, total_put = sum(call_oi.values()), sum(put_oi.values())
+                    pcr = round(total_put / total_call, 2) if total_call else None
+                    resistance = max(call_oi, key=call_oi.get) if call_oi else None
+                    support = max(put_oi, key=put_oi.get) if put_oi else None
+
+                    st.metric("Nifty Spot", f"{spot:.2f}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("PCR (OI)", pcr if pcr else "—")
+                    c2.metric("Resistance", resistance if resistance else "—")
+                    c3.metric("Support", support if support else "—")
+                    if pcr:
+                        bias = "Mildly Bullish" if pcr > 1.1 else "Mildly Bearish" if pcr < 0.8 else "Range-bound"
+                        st.info(f"📌 **{bias}** (PCR={pcr}). Support ~{support}, Resistance ~{resistance}.")
+                except Exception:
+                    st.warning("Option-chain data parse नहीं हो पाया।")
+            else:
+                st.warning("NSE Option-Chain data नहीं मिला।")
+    else:
+        st.info("💡 FII/DII और Option Chain Data देखने के लिए ऊपर **▶️ FII/DII + Nifty Data Load करें** बटन पर क्लिक करें।")
+
+# ---------- TAB 9: DELIVERY % + BULK/BLOCK DEALS (DEFERRED LOAD ON TOUCH) ----------
+with tab_delivery:
+    if st.button("▶️ Delivery & Deals Data Load करें", key="btn_deliv"):
+        st.subheader("📦 Delivery % — पिछले 2 दिन (Compare)")
+        with st.spinner("पिछले 2 दिन का delivery data देखा जा रहा है..."):
+            deliv_date, deliv_rows = get_delivery_2day_compare(selected_stocks)
+
+        if deliv_date is None or not deliv_rows:
+            st.info("Delivery data लोड नहीं हो सका या watchlist खाली है।")
+        else:
+            ddf = pd.DataFrame(deliv_rows).sort_values("बदलाव", ascending=False)
+            def hl_change(val):
+                if val > 0: return f"background-color:{COLOR_POS_BG}; color:{COLOR_POS_TEXT}; font-weight:600;"
+                if val < 0: return f"background-color:{COLOR_NEG_BG}; color:{COLOR_NEG_TEXT}; font-weight:600;"
+                return ""
+
+            styler = _styler_apply_map(ddf.style, hl_change, ["बदलाव"])
+            st.dataframe(
+                styler, use_container_width=True, hide_index=True,
+                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")},
+            )
+
+        st.markdown("---")
+        st.subheader("🏦 Bulk / Block Deals (आपकी Watchlist में)")
+        deals_data = fetch_bulk_block_deals()
+        if deals_data:
+            bulk = filter_deals_for_watchlist(deals_data.get("BULK_DEALS_DATA", []), selected_stocks)
+            block = filter_deals_for_watchlist(deals_data.get("BLOCK_DEALS_DATA", []), selected_stocks)
+            if bulk is not None and not bulk.empty:
+                st.markdown("**Bulk Deals**")
+                st.dataframe(bulk, use_container_width=True, hide_index=True)
+            if block is not None and not block.empty:
+                st.markdown("**Block Deals**")
+                st.dataframe(block, use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 Delivery और Deals Data देखने के लिए ऊपर **▶️ Delivery & Deals Data Load करें** बटन पर क्लिक करें।")
+
+# ---------- TAB 10: TOP GAINERS / LOSERS (DEFERRED LOAD ON TOUCH) ----------
+with tab_movers:
+    if st.button("▶️ Top Gainers & Losers Load करें", key="btn_movers"):
+        st.subheader("🏆 Top 5 Gainers & Top 5 Losers")
+        quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
+        mv_rows = []
+        for s in selected_stocks:
+            qd = quotes.get(yf_ticker_for_stock(s))
+            if qd:
+                mv_rows.append({"Stock": s, "LTP": qd["price"], "pct": qd["pct"], "chg": qd.get("chg"),
+                                 "Chart": tv_link(tv_symbol_for_stock(s))})
+        mv_df = pd.DataFrame(mv_rows)
+        if not mv_df.empty:
+            gainers = mv_df.sort_values("pct", ascending=False).head(5).copy()
+            losers = mv_df.sort_values("pct", ascending=True).head(5).copy()
+            for _df in (gainers, losers):
+                _df["Change"] = _df.apply(lambda r: fmt_change(r["chg"], r["pct"]), axis=1)
+                _df.drop(columns=["pct", "chg"], inplace=True)
+
+            st.markdown("#### 🟢 Top 5 Gainers")
+            st.dataframe(
+                style_pct_columns(gainers.style.format({"LTP": "{:.2f}"}), ["Change"]),
+                use_container_width=True, hide_index=True,
+                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
+            )
+            st.markdown("#### 🔴 Top 5 Losers")
+            st.dataframe(
+                style_pct_columns(losers.style.format({"LTP": "{:.2f}"}), ["Change"]),
+                use_container_width=True, hide_index=True,
+                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")},
+            )
+    else:
+        st.info("💡 Gainers & Losers देखने के लिए ऊपर **▶️ Top Gainers & Losers Load करें** बटन पर क्लिक करें।")
