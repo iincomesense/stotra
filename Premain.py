@@ -446,6 +446,8 @@ def fmt_change(chg, pct):
 
 # ============================== TIMEFRAMES & INDICATOR ENGINES ==============================
 TIMEFRAMES = {
+    "3 Min":   {"interval": "1m",  "period": "5d",  "resample": "3min",  "intraday": True},
+    "5 Min":   {"interval": "5m",  "period": "5d",  "resample": None,    "intraday": True},
     "15 Min":  {"interval": "5m",  "period": "5d",  "resample": "15min", "intraday": True},
     "30 Min":  {"interval": "15m", "period": "1mo", "resample": "30min", "intraday": True},
     "75 Min":  {"interval": "15m", "period": "1mo", "resample": "75min", "intraday": True},
