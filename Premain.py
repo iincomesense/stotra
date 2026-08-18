@@ -1038,7 +1038,7 @@ with tab_global:
 
     # ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
-    st.subheader("Real-Time AI Market Inte & Op. Hypothesis ")
+    st.subheader("AI Market Inte & Op. Hypothesis ")
     st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Top 10 Stocks OI + FII/DII Trends + Global Cues")
 
     with st.spinner("AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
@@ -1131,7 +1131,7 @@ with tab_news:
         bias_text = "न्यूट्रल / रेंजबाउंड (Breakout/Breakdown Confirmation Required)"
 
     # Top Opening Hypothesis Banner
-    st.markdown("### 🌅 Closing Analysis & Opening Hypothesis")
+    st.markdown(" Closing Analysis & Opening Hypothesis")
     col_h1, col_h2 = st.columns([1.3, 1])
     
     with col_h1:
@@ -1163,10 +1163,10 @@ with tab_news:
     st.markdown("---")
 
     # Smart Trader Deep Dive Sections (Bullet Points format)
-    st.markdown("## 🧠 Intraday Smart Trader AI Market Hypothesis & Multi-Stream Analysis")
+    st.markdown("Intraday Smart Trader AI Market Hypothesis & Multi-Stream Analysis")
 
     # Section 1: Global Instruments & Macro Cues
-    st.markdown("### 🌐 1. ग्लोबल इंस्ट्रूमेंट्स, क्रूड & कमोडिटी सेंटीमेंट")
+    st.markdown("1. ग्लोबल इंस्ट्रूमेंट्स, क्रूड & कमोडिटी सेंटीमेंट")
     st.markdown("""
 * **US Dollar Index (DXY) & USD/INR:** डॉलर इंडेक्स में मजबूती इमर्जिंग मार्केट्स (भारत) से FII आउटफ्लो का दबाव बनाती है। DXY का 104 के ऊपर स्थिर होना रुपया (USD/INR) पर दबाव डालता है।
 * **US 10-Yr Treasury Yield (^TNX) & TLT:** बॉन्ड यील्ड में 4.2%+ की बढ़त रिस्क-ऑफ (Risk-Off) सेंटीमेंट लाती है, जिससे इक्विटी मार्केट्स में प्रॉफिट बुकिंग देखने को मिलती है।
@@ -1176,7 +1176,7 @@ with tab_news:
 """)
 
     # Section 2: FII & DII Data Analysis
-    st.markdown("### 🏦 2. FII & DII पिछले 2-3 दिनों का फ्लो डेटा एनालिसिस")
+    st.markdown("2. FII & DII पिछले 2-3 दिनों का फ्लो डेटा एनालिसिस")
     st.markdown(f"""
 * **FII Net Cash Activity:** हालिया आंकड़े दर्शा रहे हैं कि FII की नेट वैल्यू **₹{fii_net_val} Cr** रही। {'FIIs नेट बायर्स हैं जो मार्केट को संस्थागत मजबूती दे रहे हैं।' if fii_net_val > 0 else 'FIIs कैश सेगमेंट में नेट सेलर हैं, जो ऊपरी स्तरों पर सप्लाई प्रेशर दर्शाता है।'}
 * **DII Net Cash Activity:** DIIs म्यूचुअल फंड SIP इनफ्लो के दम पर **₹{dii_net_val if dii_net_val else 'सकारात्मक'} Cr** का नेट सपोर्ट दे रहे हैं, जिससे बाजार में हर गिरावट पर बाइंग (Dip buying) की ताकत बनी हुई है।
@@ -1184,7 +1184,7 @@ with tab_news:
 """)
 
     # Section 3: Option Chain OI & PCR Structure
-    st.markdown("### 🎯 3. Nifty Option Chain, PCR & Strike Level Dynamic")
+    st.markdown(" 3. Nifty Option Chain, PCR & Strike Level Dynamic")
     st.markdown(f"""
 * **Current Put-Call Ratio (PCR):** निफ्टी का PCR वर्तमान में **{pcr_value}** है।
   * *PCR > 1.2:* ओवरसोल्ड रिकवरी या स्ट्रॉन्ग बुलिश सेंटीमेंट (पुट राइटिंग हैवी)।
