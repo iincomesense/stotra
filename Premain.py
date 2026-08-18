@@ -846,7 +846,7 @@ def fetch_nse_corporate_announcements():
 
 # ---------- TAB 1: FAST EMA/VOLUME/RSI & INSTITUTIONAL D&S SIGNALS (AUTO-REFRESH) ----------
 with tab_signals:
-    st.subheader("📊 Institutional D&S + Technical Multi-Asset Scanner")
+    st.subheader("D&S tech.Scanner")
     
     is_after_close = now_ist().hour >= 16 or now_ist().hour < 8
     if is_after_close:
