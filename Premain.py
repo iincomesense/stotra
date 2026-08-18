@@ -1038,10 +1038,10 @@ with tab_global:
 
     # ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
-    st.subheader("🤖 Real-Time AI Market Intelligence & Opening Hypothesis Engine")
+    st.subheader("Real-Time AI Market Inte & Op. Hypothesis ")
     st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Top 10 Stocks OI + FII/DII Trends + Global Cues")
 
-    with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
+    with st.spinner("AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
         # 1. Macro Quotes Fetching
         macro_symbols = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
         macro_quotes = get_quotes(macro_symbols) if 'get_quotes' in globals() else {}
