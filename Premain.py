@@ -456,26 +456,38 @@ TIMEFRAMES = {
     "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
 }
 
+def calc_ema_np(arr: np.ndarray, span: int) -> np.ndarray:
+    """Reusable NumPy EMA calculator (extracted so 20/50 AND 3/5 can share it)."""
+    alpha = 2.0 / (span + 1.0)
+    res = np.empty_like(arr)
+    res[0] = arr[0]
+    one_minus_alpha = 1.0 - alpha
+    for i in range(1, len(arr)):
+        res[i] = alpha * arr[i] + one_minus_alpha * res[i - 1]
+    return res
+
+def check_ema_cross_generic(close: np.ndarray, fast: int = 20, slow: int = 50, label: str = ""):
+    """Generic NumPy Optimized EMA Crossover Check for any (fast, slow) pair."""
+    if len(close) < slow:
+        return None
+    ema_fast = calc_ema_np(close, fast)
+    ema_slow = calc_ema_np(close, slow)
+    tag = label or f"EMA {fast}/{slow}"
+    if ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]:
+        return f"🟢 {tag} UP"
+    if ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]:
+        return f"🔴 {tag} DOWN"
+    return None
+
 def check_ema_cross_fast(close: np.ndarray):
     """NumPy Optimized EMA 20/50 Crossover Check"""
-    if len(close) < 50: return None
-    
-    def calc_ema(arr, span):
-        alpha = 2.0 / (span + 1.0)
-        res = np.empty_like(arr)
-        res[0] = arr[0]
-        one_minus_alpha = 1.0 - alpha
-        for i in range(1, len(arr)):
-            res[i] = alpha * arr[i] + one_minus_alpha * res[i-1]
-        return res
+    return check_ema_cross_generic(close, 20, 50, "EMA20/50")
 
-    ema20 = calc_ema(close, 20)
-    ema50 = calc_ema(close, 50)
-    if ema20[-2] <= ema50[-2] and ema20[-1] > ema50[-1]:
-        return "🟢 EMA UP"
-    if ema20[-2] >= ema50[-2] and ema20[-1] < ema50[-1]:
-        return "🔴 EMA DOWN"
-    return None
+def check_ema_cross_3_5(close: np.ndarray):
+    """NumPy Optimized EMA 3/5 Crossover Check — fast scalping / very-short-term intraday signal.
+    Needs at least 5 bars; naturally fires far more often than 20/50, so treat it as a
+    'momentum trigger' rather than a standalone trade signal — confirm with volume/RSI/D&S zone."""
+    return check_ema_cross_generic(close, 3, 5, "EMA3/5")
 
 def check_volume_spike_fast(vol: np.ndarray, mult=2.0):
     """NumPy Optimized Volume Spike Check"""
@@ -568,8 +580,8 @@ else:
 
 selected_indicators = st.sidebar.multiselect(
     "इंडिकेटर चुनें (Signals)",
-    ["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "Volume Spike", "RSI (14)"],
-    default=["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "Volume Spike"]
+    ["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "EMA Crossover (3/5)", "Volume Spike", "RSI (14)"],
+    default=["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "EMA Crossover (3/5)", "Volume Spike"]
 )
 
 vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
@@ -887,10 +899,15 @@ with tab_signals:
                         type_parts.append(ds_sig)
                         if is_hq: is_hq_ds_zone = True
 
-                # 2. EMA Crossover
+                # 2. EMA Crossover (20/50)
                 if "EMA Crossover (20/50)" in selected_indicators:
                     cross = check_ema_cross_fast(close_np)
                     if cross: type_parts.append(cross)
+
+                # 2b. EMA Crossover (3/5) — fast scalping trigger
+                if "EMA Crossover (3/5)" in selected_indicators:
+                    cross_35 = check_ema_cross_3_5(close_np)
+                    if cross_35: type_parts.append(cross_35)
 
                 # 3. Volume Spike
                 if "Volume Spike" in selected_indicators:
