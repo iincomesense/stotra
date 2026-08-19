@@ -1139,7 +1139,7 @@ with tab3:
             st.info("कोई high-impact event नहीं।")
         else:
             for evt in events[:10]:
-                impact_color = {"High": "#ea4335", "Medium": "#fbbc04"}.get(evt["impact"], "#555")
+                impact_color = {"High": "#ea4335", "Medium": "#fbbc04"}.get(.get["impact"], "#555")
                 st.markdown(
                     f"""
                     <div style="background-color: #fef7e0; border-radius: 8px; padding: 10px; margin-bottom: 8px; border-left: 4px solid {impact_color};">
