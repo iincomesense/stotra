@@ -1,26 +1,19 @@
-"""
-ULTIMATE SCALPING + INTRADAY + SWING TRADING DASHBOARD
-========================================================
-✅ Real Market Data (100% Live)
-✅ Real News + Corporate Events (API-driven)
-✅ Institutional D&S Zones + Technical Signals
-✅ AI Buy/Sell Hypothesis (Live Market + News)
-✅ Push Notifications + Desktop Alerts
-✅ One-Stop Dashboard (सब कुछ एक जगह)
-✅ High-Performance Caching + Parallel Processing
-✅ Scalping (1-5 min) + Intraday (15 min-4 hours) + Swing (Daily)
-"""
+# app.py
+# ================================================================
+# MARKET INTELLIGENCE DASHBOARD v3
+# Streamlit + D&S + Technicals + News + Macro + India Events
+# + Nifty PCR/OI + Stock F&O PCR/OI + FII/DII + Auto Hypothesis
+# ================================================================
 
-import concurrent.futures
 import io
-import urllib.parse
-from datetime import datetime, timedelta, timezone
-from datetime import time as dtime
-from typing import List, Optional, Tuple, Dict, Any
-import logging
-import hashlib
+import re
 import time
-from functools import lru_cache, wraps
+import math
+import urllib.parse
+import concurrent.futures
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone, time as dtime
+from typing import Optional, Dict, List, Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,9 +23,8 @@ import yfinance as yf
 
 try:
     import feedparser
-    HAS_FEEDPARSER = True
 except ImportError:
-    HAS_FEEDPARSER = False
+    feedparser = None
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -40,1280 +32,2287 @@ try:
 except ImportError:
     HAS_AUTOREFRESH = False
 
-try:
-    from plyer import notification
-    HAS_PLYER = True
-except ImportError:
-    HAS_PLYER = False
 
-import streamlit.components.v1 as components
+# ================================================================
+# 1. APP CONFIG
+# ================================================================
 
-# ==========================================
-# 0. LOGGING SETUP
-# ==========================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+st.set_page_config(
+    page_title="Institutional Market Intelligence",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-def handle_error(func):
-    """Error handling decorator"""
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Error in {func.__name__}: {str(e)}")
-            return None
-    return wrapper
+IST = timezone(timedelta(hours=5, minutes=30))
 
-def retry_with_backoff(max_retries=3, backoff_factor=1.2):
-    """Retry decorator with exponential backoff"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        logger.error(f"{func.__name__} failed: {e}")
-                        return None
-                    time.sleep(backoff_factor ** attempt)
-            return None
-        return wrapper
-    return decorator
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+}
 
-# ==========================================
-# 1. INSTITUTIONAL D&S CONFIGURATION
-# ==========================================
-TARGET_RR = 5.0
-SL_BUFFER_ATR = 0.1
+RAW_STOCKS = """
+RELIANCE,HDFCBANK,ICICIBANK,SBIN,AXISBANK,KOTAKBANK,
+TCS,INFY,HCLTECH,WIPRO,TECHM,
+BHARTIARTL,ITC,LT,BAJFINANCE,
+TATAMOTORS,MARUTI,M&M,
+TATASTEEL,JSWSTEEL,HINDALCO,
+SUNPHARMA,CIPLA,DRREDDY,
+ONGC,BPCL,IOC,COALINDIA,NTPC,
+ADANIENT,ADANIPORTS,POWERGRID
+"""
+
+WATCHLIST = list(
+    dict.fromkeys(
+        x.strip()
+        for x in RAW_STOCKS.replace("\n", "").split(",")
+        if x.strip()
+    )
+)
+
+YF_FIX = {
+    "BAJAJ_AUTO": "BAJAJ-AUTO",
+}
+
+TV_FIX = {
+    "BAJAJ_AUTO": "BAJAJ-AUTO",
+}
+
+GLOBAL_SYMBOLS = {
+    "S&P500": "^GSPC",
+    "NASDAQ": "^IXIC",
+    "Dow": "^DJI",
+    "DXY": "DX-Y.NYB",
+    "US10Y": "^TNX",
+    "USDINR": "INR=X",
+    "Crude": "CL=F",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Copper": "HG=F",
+    "Nikkei": "^N225",
+    "FTSE": "^FTSE",
+}
+
+TIMEFRAMES = {
+    "5 Min":  {"interval": "5m",  "period": "5d",  "resample": None},
+    "15 Min": {"interval": "5m",  "period": "5d",  "resample": "15min"},
+    "1 Hour": {"interval": "60m", "period": "1mo", "resample": None},
+    "Daily":  {"interval": "1d",  "period": "6mo", "resample": None},
+}
+
+# D&S
 ATR_PERIOD = 14
 LEG_OUT_ATR_MULT = 1.2
 HQ_LEG_OUT_ATR = 2.0
-LEG_IN_STRONG_CLOSE_PCT = 0.70
+MAX_BASE_ATR_MULT = 1.0
+MAX_WICK_PCT = 0.25
+
 BASE_MAX_BODY_RATIO = 0.35
-BASE_MIN_OVERLAP_PCT = 0.50
-BASE_VOL_MAX_RATIO = 1.0
-LEG_OUT_VOL_LOOKBACK = 20
+BASE_MIN_OVERLAP = 0.50
 LEG_OUT_VOL_MULT = 1.5
-MIN_PROXIMITY_PCT = 0.005
-MAX_PROXIMITY_PCT = 0.010
 
-# ==========================================
-# 2. VECTORIZED NUMPY CALCULATIONS
-# ==========================================
-@handle_error
-def calculate_atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-    """Fast ATR calculation"""
-    n = len(high)
-    if n < 2:
-        return np.zeros(n)
-    
-    tr = np.maximum(high[1:] - low[1:], 
-                    np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
-    tr = np.insert(tr, 0, high[0] - low[0])
+MIN_BASE = 1
+MAX_BASE = 3
 
-    atr = np.empty(n, dtype=np.float64)
-    atr[0] = tr[0]
-    alpha = 1.0 / period
-    for i in range(1, n):
-        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
-    return atr
+TARGET_RR = 3.0
+SL_ATR_BUFFER = 0.10
 
-def calculate_pivots_np(highs: np.ndarray, lows: np.ndarray, left: int = 5, right: int = 5):
-    """Calculate pivot highs/lows"""
-    n = len(highs)
-    pivot_h = np.full(n, np.nan)
-    pivot_l = np.full(n, np.nan)
 
-    for i in range(left, n - right):
-        window_h = highs[i - left : i + right + 1]
-        if highs[i] == np.max(window_h) and np.sum(window_h == highs[i]) == 1:
-            pivot_h[i] = highs[i]
-        
-        window_l = lows[i - left : i + right + 1]
-        if lows[i] == np.min(window_l) and np.sum(window_l == lows[i]) == 1:
-            pivot_l[i] = lows[i]
+# ================================================================
+# 2. UTILITIES
+# ================================================================
 
-    return pivot_h, pivot_l
+def now_ist():
+    return datetime.now(IST)
 
-# ==========================================
-# 3. ZONE CLASS & D&S SCANNER
-# ==========================================
-class DemandSupplyZone:
-    """Institutional D&S Zone"""
-    def __init__(self, prox, dist, sl, tp, is_demand, is_hq, density, idx, tf):
-        self.proximity_val = prox
-        self.distribution_val = dist
-        self.stop_loss = sl
-        self.take_profit = tp
-        self.is_demand = is_demand
-        self.is_hq = is_hq
-        self.density_score = density
-        self.start_idx = idx
-        self.timeframe = tf
-        self.state = "Fresh"  # Fresh, Retest, Filled
-        self.touch_count = 0
-        self.activation_time = datetime.now(timezone.utc)
 
-    def to_dict(self):
-        return {
-            "Entry": round(self.proximity_val, 2),
-            "SL": round(self.stop_loss, 2),
-            "TP": round(self.take_profit, 2),
-            "Side": "BUY" if self.is_demand else "SELL",
-            "Type": "🚀 HQ" if self.is_hq else "⭐ Zone",
-            "State": self.state,
-            "TF": self.timeframe,
-        }
+def yf_stock(symbol: str) -> str:
+    return f"{YF_FIX.get(symbol, symbol)}.NS"
 
-@handle_error
-def scan_ds_zones(df: pd.DataFrame, timeframe: str = "1H") -> List[DemandSupplyZone]:
-    """Scan institutional D&S zones"""
-    if df is None or len(df) < 30:
-        return []
 
+def tv_stock(symbol: str) -> str:
+    s = TV_FIX.get(symbol, symbol)
+    return (
+        "https://www.tradingview.com/chart/?symbol="
+        + urllib.parse.quote(f"NSE:{s}")
+    )
+
+
+def safe_float(x, default=0.0):
     try:
-        high = df['High'].to_numpy(dtype=np.float64)
-        low = df['Low'].to_numpy(dtype=np.float64)
-        close = df['Close'].to_numpy(dtype=np.float64)
-        open_p = df['Open'].to_numpy(dtype=np.float64)
-        volume = df['Volume'].to_numpy(dtype=np.float64)
-        n = len(high)
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
 
-        atr = calculate_atr_np(high, low, close, ATR_PERIOD)
-        pivot_h, pivot_l = calculate_pivots_np(high, low, 5, 5)
 
-        tr = high - low
-        is_bull = close > open_p
+def flatten_yf(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-        all_zones = []
-        last_pivot_high = np.nan
-        last_pivot_low = np.nan
+    df = df.copy()
 
-        for i in range(15, n):
-            if not np.isnan(pivot_h[i]):
-                last_pivot_high = pivot_h[i]
-            if not np.isnan(pivot_l[i]):
-                last_pivot_low = pivot_l[i]
-
-            for base_count in range(1, 4):
-                leg_out_idx = i
-                leg_in_idx = i - base_count - 1
-
-                if leg_in_idx < 0:
-                    continue
-
-                leg_out_tr = tr[leg_out_idx]
-                leg_in_tr = tr[leg_in_idx]
-                leg_out_atr = atr[leg_out_idx]
-
-                # Base candle checks
-                base_tr = tr[leg_in_idx + 1 : leg_out_idx]
-                if len(base_tr) == 0:
-                    continue
-
-                max_base_tr = np.max(base_tr) if len(base_tr) > 0 else 0
-                max_base_h = np.max(high[leg_in_idx + 1 : leg_out_idx]) if len(high[leg_in_idx + 1 : leg_out_idx]) > 0 else 0
-                min_base_l = np.min(low[leg_in_idx + 1 : leg_out_idx]) if len(low[leg_in_idx + 1 : leg_out_idx]) > 0 else high[leg_in_idx]
-
-                # Validation checks
-                valid_tr_hierarchy = (leg_out_tr > leg_in_tr) and (leg_in_tr > max_base_tr)
-                valid_leg_out = leg_out_tr >= (LEG_OUT_ATR_MULT * leg_out_atr)
-                valid_volume = volume[leg_out_idx] > volume[leg_in_idx]
-
-                if not (valid_tr_hierarchy and valid_leg_out and valid_volume):
-                    continue
-
-                # Zone creation
-                is_demand = is_bull[leg_out_idx]
-                prox_val = max_base_h if is_demand else min_base_l
-                dist_val = min_base_l if is_demand else max_base_h
-
-                # HQ score
-                density = 25
-                if leg_out_tr >= HQ_LEG_OUT_ATR * leg_out_atr:
-                    density += 25
-                if base_count <= 2 and max_base_tr <= 0.7 * atr[i-1]:
-                    density += 25
-
-                is_hq = density >= 75
-
-                # R:R calculation
-                curr_atr = leg_out_atr
-                sl_val = (dist_val - (SL_BUFFER_ATR * curr_atr)) if is_demand else (dist_val + (SL_BUFFER_ATR * curr_atr))
-                risk = abs(prox_val - sl_val)
-                tp_val = (prox_val + (risk * TARGET_RR)) if is_demand else (prox_val - (risk * TARGET_RR))
-
-                zone = DemandSupplyZone(prox_val, dist_val, sl_val, tp_val, is_demand, is_hq, density, i, timeframe)
-                
-                # Duplicate check
-                is_dup = any(
-                    z.is_demand == is_demand and abs(z.proximity_val - prox_val) < (curr_atr * 0.25)
-                    for z in all_zones[-5:]
-                )
-                if not is_dup:
-                    all_zones.append(zone)
-                break
-
-        # Update zone states
-        curr_price = close[-1]
-        for z in all_zones:
-            if z.state == "Filled":
-                continue
-            if z.is_demand:
-                touched = curr_price <= z.proximity_val
-                filled = curr_price <= z.distribution_val
-            else:
-                touched = curr_price >= z.proximity_val
-                filled = curr_price >= z.distribution_val
-
-            if filled:
-                z.state = "Filled"
-            elif touched:
-                z.touch_count += 1
-                z.state = "Retest"
-
-        return all_zones
-    except Exception as e:
-        logger.error(f"D&S scan error: {e}")
-        return []
-
-# ==========================================
-# 4. GLOBAL SETUP
-# ==========================================
-IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_OPEN = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
-
-COLOR_POS_BG, COLOR_POS_TEXT = "#d4f8d4", "#0a7d2f"
-COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8f8d4", "#c0392b"
-COLOR_SPIKE_BG = "#ffe1a8"
-
-STOCKS_LIST = """TCS,HCLTECH,INFY,WIPRO,TECHM,COFORGE,PERSISTENT,M&M,MARUTI,TATAMOTORS,
-HEROMOTOCO,BAJAJ_AUTO,EICHERMOT,SBIN,HDFCBANK,ICICIBANK,KOTAKBANK,AXISBANK,AUBANK,
-INDUSINDBK,IDFCFIRSTB,CANBK,FEDERALBNK,RELIANCE,BHARTIARTL,ONGC,OIL,BPCL,IOC,
-HINDPETRO,POWERGRID,NTPC,JSWENERGY,TATAPOWER,ADANIPORTS,ADANIENT,LT,JSWSTEEL,
-TATASTEEL,HINDALCO,VEDL,NATIONALUM,JINDALSTEL,ASIANPAINT,BRITANNIA,ITC,NESTLEIND,
-HINDUNILVR,DABUR,MARICO,GODREJCP,SUNPHARMA,CIPLA,DRREDDY,LUPIN,AUROPHARMA,LAURUSLABS,
-DIVISLAB,TORNTPHARM,APOLLOHOSP,MAXHEALTH,APLAPOLLO,TITAN,DMART,NAUKRI,PERSISTENT,
-HDFCAMC,SBILIFE,HDFCLIFE,ICICIGI,BAJFINANCE,SHRIRAMFIN,MUTHOOTFIN,CHOLAFIN,POLYCAB,
-HAVELLS,SIEMENS,CUMMINSIND,BHEL,BEL,COALINDIA,NMDC,RECLTD,PFC,GAIL,MCX"""
-
-WATCHLIST = list(dict.fromkeys([s.strip() for s in STOCKS_LIST.replace("\n", "").split(",") if s.strip()]))
-
-YF_FIX = {"BAJAJ_AUTO": "BAJAJ-AUTO"}
-TV_FIX = {"BAJAJ_AUTO": "BAJAJ-AUTO"}
-
-GLOBAL_INSTRUMENTS = [
-    ("DXY", "US Dollar Index", "DX-Y.NYB", "TVC:DXY"),
-    ("USDINR", "USD / INR", "INR=X", "FX_IDC:USDINR"),
-    ("US10Y", "US 10-Yr Treasury", "^TNX", "TVC:US10Y"),
-    ("XAUUSD", "Gold", "GC=F", "TVC:GOLD"),
-    ("XAGUSD", "Silver", "SI=F", "TVC:SILVER"),
-    ("SPOTCRUDE", "WTI Crude", "CL=F", "TVC:USOIL"),
-    ("COPPER", "Copper", "HG=F", "COMEX:HG1!"),
-    ("US30", "Dow Jones", "^DJI", "TVC:DJI"),
-    ("US500", "S&P 500", "^GSPC", "TVC:SPX"),
-]
-
-NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-}
-
-TIMEFRAMES_CONFIG = {
-    "1m": {"yf": "1m", "period": "7d", "display": "1 Min", "type": "scalping"},
-    "3m": {"yf": "1m", "period": "7d", "display": "3 Min", "type": "scalping"},
-    "5m": {"yf": "5m", "period": "5d", "display": "5 Min", "type": "scalping"},
-    "15m": {"yf": "5m", "period": "5d", "display": "15 Min", "type": "intraday"},
-    "30m": {"yf": "30m", "period": "10d", "display": "30 Min", "type": "intraday"},
-    "1h": {"yf": "60m", "period": "1mo", "display": "1 Hour", "type": "intraday"},
-    "4h": {"yf": "60m", "period": "3mo", "display": "4 Hours", "type": "swing"},
-    "1d": {"yf": "1d", "period": "6mo", "display": "Daily", "type": "swing"},
-}
-
-# ==========================================
-# 5. ADVANCED SMART CACHE
-# ==========================================
-class SmartCache:
-    def __init__(self, ttl_seconds=300):
-        self.cache = {}
-        self.ttl = ttl_seconds
-        self.timestamps = {}
-    
-    def get_key(self, func_name, args, kwargs):
-        key_str = f"{func_name}_{str(args)}_{str(kwargs)}"
-        return hashlib.md5(key_str.encode()).hexdigest()
-    
-    def get(self, func_name, args, kwargs):
-        key = self.get_key(func_name, args, kwargs)
-        if key in self.cache:
-            elapsed = time.time() - self.timestamps.get(key, 0)
-            if elapsed < self.ttl:
-                return self.cache[key]
-        return None
-    
-    def set(self, func_name, args, kwargs, value):
-        key = self.get_key(func_name, args, kwargs)
-        self.cache[key] = value
-        self.timestamps[key] = time.time()
-    
-    def clear(self):
-        self.cache.clear()
-        self.timestamps.clear()
-
-smart_cache = SmartCache(ttl_seconds=240)
-
-def cached_call(func):
-    def wrapper(*args, **kwargs):
-        result = smart_cache.get(func.__name__, args, kwargs)
-        if result is not None:
-            return result
-        try:
-            result = func(*args, **kwargs)
-            smart_cache.set(func.__name__, args, kwargs, result)
-            return result
-        except Exception as e:
-            logger.error(f"{func.__name__} error: {e}")
-            return None
-    return wrapper
-
-# ==========================================
-# 6. DATA FETCHING
-# ==========================================
-@cached_call
-@retry_with_backoff(max_retries=3)
-def get_stock_data(ticker: str, period: str, interval: str) -> Optional[pd.DataFrame]:
-    """Fetch stock data from YFinance"""
-    try:
-        yf_ticker = f"{YF_FIX.get(ticker, ticker)}.NS"
-        df = yf.download(yf_ticker, period=period, interval=interval, progress=False)
-        
-        if df.empty:
-            return None
-        
-        # Resample if needed
-        if interval == "1m" and period in ["5d", "7d"]:
-            df_3m = df.resample("3min").agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-            df_15m = df.resample("15min").agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-            
-            return df, df_3m, df_15m  # 1m, 3m, 15m
-        elif interval == "5m":
-            df_15m = df.resample("15min").agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-            return df, df_15m  # 5m, 15m
-        elif interval == "30m":
-            return df,  # 30m
-        else:
-            return df,  # Single timeframe
-
-    except Exception as e:
-        logger.error(f"Data fetch error for {ticker}: {e}")
-        return None
-
-@cached_call
-@retry_with_backoff(max_retries=2)
-def get_quotes(tickers: List[str]) -> Dict[str, Dict]:
-    """Get live quotes"""
-    quotes = {}
-    for ticker in tickers:
-        try:
-            yf_ticker = f"{YF_FIX.get(ticker, ticker)}.NS"
-            data = yf.download(yf_ticker, period="5d", interval="1d", progress=False)
-            
-            if not data.empty and len(data) >= 2:
-                last = data['Close'].iloc[-1]
-                prev = data['Close'].iloc[-2]
-                chg = last - prev
-                pct = (chg / prev) * 100
-                quotes[ticker] = {"price": float(last), "chg": float(chg), "pct": float(pct)}
-        except Exception as e:
-            logger.warning(f"Quote error for {ticker}: {e}")
-            continue
-    
-    return quotes
-
-def parallel_fetch_data(tickers: List[str], timeframe_key: str):
-    """Fetch data for multiple tickers in parallel"""
-    tf_cfg = TIMEFRAMES_CONFIG.get(timeframe_key, {})
-    yf_interval = tf_cfg.get("yf", "1h")
-    period = tf_cfg.get("period", "5d")
-    
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(get_stock_data, t, period, yf_interval): t for t in tickers}
-        for future in concurrent.futures.as_completed(futures):
-            ticker = futures[future]
+    if isinstance(df.columns, pd.MultiIndex):
+        if len(df.columns.levels) == 2:
+            # Single ticker edge case
             try:
-                data = future.result()
-                if data:
-                    results[ticker] = data
-            except Exception as e:
-                logger.warning(f"Parallel fetch error for {ticker}: {e}")
-    
-    return results
-
-# ==========================================
-# 7. TECHNICAL INDICATORS
-# ==========================================
-def calc_ema(close: np.ndarray, span: int) -> np.ndarray:
-    """Calculate EMA"""
-    alpha = 2.0 / (span + 1.0)
-    ema = np.zeros_like(close)
-    ema[0] = close[0]
-    for i in range(1, len(close)):
-        ema[i] = alpha * close[i] + (1 - alpha) * ema[i-1]
-    return ema
-
-@handle_error
-def get_technical_signals(df: pd.DataFrame) -> Dict[str, Any]:
-    """Get technical signals"""
-    if df is None or len(df) < 20:
-        return {}
-    
-    try:
-        close = df['Close'].to_numpy(dtype=np.float64)
-        vol = df['Volume'].to_numpy(dtype=np.float64)
-        high = df['High'].to_numpy(dtype=np.float64)
-        low = df['Low'].to_numpy(dtype=np.float64)
-        
-        signals = {}
-        
-        # EMA Crossover (20/50)
-        ema20 = calc_ema(close, 20)
-        ema50 = calc_ema(close, 50)
-        if ema20[-2] <= ema50[-2] and ema20[-1] > ema50[-1]:
-            signals["ema_20_50"] = "🟢 EMA20/50 UP"
-        elif ema20[-2] >= ema50[-2] and ema20[-1] < ema50[-1]:
-            signals["ema_20_50"] = "🔴 EMA20/50 DOWN"
-        
-        # Volume Spike
-        avg_vol = np.mean(vol[-20:-1])
-        if avg_vol > 0 and vol[-1] / avg_vol >= 2.0:
-            signals["vol_spike"] = f"⚡ Vol {vol[-1]/avg_vol:.1f}x"
-        
-        # RSI
-        diffs = np.diff(close)
-        gains = np.where(diffs > 0, diffs, 0)
-        losses = np.where(diffs < 0, -diffs, 0)
-        avg_gain = np.mean(gains[-14:]) if len(gains) >= 14 else np.mean(gains)
-        avg_loss = np.mean(losses[-14:]) if len(losses) >= 14 else np.mean(losses)
-        rsi = 100 - (100 / (1 + (avg_gain / avg_loss if avg_loss > 0 else 1)))
-        
-        if rsi >= 70:
-            signals["rsi"] = f"🔥 RSI OB ({rsi:.0f})"
-        elif rsi <= 30:
-            signals["rsi"] = f"🧊 RSI OS ({rsi:.0f})"
-        
-        signals["current_price"] = close[-1]
-        signals["rsi_value"] = rsi
-        
-        return signals
-    except Exception as e:
-        logger.error(f"Technical signal error: {e}")
-        return {}
-
-# ==========================================
-# 8. REAL NEWS FETCHER
-# ==========================================
-@cached_call
-@retry_with_backoff(max_retries=2)
-def fetch_stock_news(stock: str, max_age_hours=24) -> List[Dict]:
-    """Fetch real news for stock"""
-    if not HAS_FEEDPARSER:
-        return []
-    
-    try:
-        query = urllib.parse.quote_plus(f"{stock} NSE India stock when:1d")
-        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-        feed = feedparser.parse(requests.get(url, timeout=10).content)
-        
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-        news_list = []
-        
-        for entry in feed.entries[:5]:
-            try:
-                pub_time = entry.get("published_parsed")
-                if pub_time:
-                    pub_dt = datetime(*pub_time[:6], tzinfo=timezone.utc)
-                    if pub_dt >= cutoff:
-                        news_list.append({
-                            "title": entry.get("title", ""),
-                            "link": entry.get("link", ""),
-                            "published": pub_dt.strftime("%H:%M %d-%b"),
-                            "source": entry.get("source", {}).get("title", "News"),
-                        })
+                df.columns = df.columns.get_level_values(0)
             except Exception:
-                continue
-        
-        return news_list
-    except Exception as e:
-        logger.warning(f"News fetch error for {stock}: {e}")
-        return []
+                pass
 
-@cached_call
-@retry_with_backoff(max_retries=2)
-def fetch_nse_announcements() -> List[Dict]:
-    """Fetch NSE corporate announcements"""
-    try:
-        url = "https://www.nseindia.com/api/corporate-announcements?index=equities"
-        r = requests.get(url, headers=NSE_HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            announcements = []
-            for item in data[:20]:
-                announcements.append({
-                    "symbol": item.get("symbol", ""),
-                    "subject": item.get("desc", "")[:100],
-                    "time": item.get("an_dt", ""),
-                })
-            return announcements
-    except Exception as e:
-        logger.warning(f"Announcements fetch error: {e}")
-    
-    return []
+    return df
 
-@cached_call
-@retry_with_backoff(max_retries=2)
-def fetch_market_events() -> List[Dict]:
-    """Fetch major market events"""
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r = requests.get(url, headers=NSE_HEADERS, timeout=10)
-        if r.status_code == 200:
-            events = r.json()
-            today = datetime.now(IST).date()
-            today_events = []
-            
-            for e in events:
-                if str(e.get("impact", "")).lower() not in ("high", "medium"):
-                    continue
-                try:
-                    ev_date = datetime.fromisoformat(e.get("date", "").replace("Z", "+00:00")).astimezone(IST).date()
-                    if ev_date == today:
-                        today_events.append({
-                            "country": e.get("country", ""),
-                            "event": e.get("name", ""),
-                            "impact": e.get("impact", ""),
-                            "time": e.get("time", ""),
-                        })
-                except Exception:
-                    continue
-            
-            return today_events
-    except Exception as e:
-        logger.warning(f"Market events fetch error: {e}")
-    
-    return []
 
-@cached_call
-@retry_with_backoff(max_retries=2)
-def fetch_nifty_pcr() -> Dict:
-    """Fetch Nifty PCR and OI data"""
-    try:
-        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-        r = requests.get(url, headers=NSE_HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            records = data["records"]["data"]
-            spot = data["records"]["underlyingValue"]
-            
-            total_call_oi = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
-            total_put_oi = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
-            pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1.0
-            
-            call_oi_map = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
-            put_oi_map = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
-            
-            return {
-                "spot": spot,
-                "pcr": round(pcr, 2),
-                "call_support": max(call_oi_map, key=call_oi_map.get) if call_oi_map else None,
-                "put_support": max(put_oi_map, key=put_oi_map.get) if put_oi_map else None,
-            }
-    except Exception as e:
-        logger.warning(f"PCR fetch error: {e}")
-    
-    return {}
+# ================================================================
+# 3. ROBUST HTTP
+# ================================================================
 
-# ==========================================
-# 9. NOTIFICATION SYSTEM
-# ==========================================
-def send_notification(title: str, message: str):
-    """Send desktop notification"""
-    if HAS_PLYER:
+def request_json(
+    url: str,
+    session: Optional[requests.Session] = None,
+    timeout=10,
+    retries=2,
+):
+    s = session or requests.Session()
+    s.headers.update(NSE_HEADERS)
+
+    for attempt in range(retries + 1):
         try:
-            notification.notify(
-                title=title,
-                message=message,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.warning(f"Notification error: {e}")
-    
-    # Also log to session for display
-    if "notifications" not in st.session_state:
-        st.session_state.notifications = []
-    
-    st.session_state.notifications.append({
-        "title": title,
-        "message": message,
-        "time": datetime.now(IST).strftime("%H:%M:%S"),
-    })
+            r = s.get(url, timeout=timeout)
+            r.raise_for_status()
 
-# ==========================================
-# 10. AI HYPOTHESIS ENGINE
-# ==========================================
-@handle_error
-def generate_hypothesis(
-    stock: str,
-    price: float,
-    signals: Dict,
-    zones: List[DemandSupplyZone],
-    news: List[Dict],
-    macro_data: Dict,
-) -> Dict:
-    """Generate AI hypothesis for a stock"""
-    
-    hypothesis = {
-        "stock": stock,
-        "price": price,
-        "signals": signals,
-        "zones": [z.to_dict() for z in zones if z.state != "Filled"],
-        "news": news,
-        "recommendation": "HOLD",
-        "confidence": 0,
-        "reasons": [],
-    }
-    
-    bull_score = 0
-    bear_score = 0
-    
-    # Signal scoring
-    if "ema_20_50" in signals:
-        if "UP" in signals["ema_20_50"]:
-            bull_score += 1.5
-            hypothesis["reasons"].append("🟢 EMA20/50 Bullish Cross")
-        else:
-            bear_score += 1.5
-            hypothesis["reasons"].append("🔴 EMA20/50 Bearish Cross")
-    
-    if "vol_spike" in signals:
-        bull_score += 0.5
-        hypothesis["reasons"].append(f"⚡ {signals['vol_spike']}")
-    
-    if "rsi" in signals:
-        if "OB" in signals["rsi"]:
-            bear_score += 0.7
-            hypothesis["reasons"].append(f"🔥 {signals['rsi']}")
-        elif "OS" in signals["rsi"]:
-            bull_score += 0.7
-            hypothesis["reasons"].append(f"🧊 {signals['rsi']}")
-    
-    # D&S Zone scoring
-    demand_zones = [z for z in zones if z.is_demand and z.state != "Filled"]
-    supply_zones = [z for z in zones if not z.is_demand and z.state != "Filled"]
-    
-    hq_demand = [z for z in demand_zones if z.is_hq]
-    hq_supply = [z for z in supply_zones if z.is_hq]
-    
-    if hq_demand:
-        bull_score += 2.0 * len(hq_demand)
-        hypothesis["reasons"].append(f"🚀 {len(hq_demand)} HQ Demand Zone(s)")
-    elif demand_zones:
-        bull_score += 1.0 * len(demand_zones)
-        hypothesis["reasons"].append(f"⭐ {len(demand_zones)} Demand Zone(s)")
-    
-    if hq_supply:
-        bear_score += 2.0 * len(hq_supply)
-        hypothesis["reasons"].append(f"🚀 {len(hq_supply)} HQ Supply Zone(s)")
-    elif supply_zones:
-        bear_score += 1.0 * len(supply_zones)
-        hypothesis["reasons"].append(f"⭐ {len(supply_zones)} Supply Zone(s)")
-    
-    # News impact
-    if news:
-        bull_score += 0.5
-        hypothesis["reasons"].append(f"📰 {len(news)} recent news item(s)")
-    
-    # Macro impact
-    if macro_data.get("sp500_pct", 0) > 0.5:
-        bull_score += 0.3
-        hypothesis["reasons"].append("🌍 Global bullish (S&P500+)")
-    elif macro_data.get("sp500_pct", 0) < -0.5:
-        bear_score += 0.3
-        hypothesis["reasons"].append("🌍 Global bearish (S&P500-)")
-    
-    # PCR impact
-    pcr = macro_data.get("pcr", 1.0)
-    if pcr > 1.2:
-        bull_score += 0.3
-        hypothesis["reasons"].append("📊 PCR bullish (Put writers)")
-    elif pcr < 0.8:
-        bear_score += 0.3
-        hypothesis["reasons"].append("📊 PCR bearish (Call writers)")
-    
-    # Final recommendation
-    net_score = bull_score - bear_score
-    confidence = min(99, int(abs(net_score) * 20))
-    
-    if net_score > 1.0:
-        hypothesis["recommendation"] = "🟢 BUY"
-    elif net_score < -1.0:
-        hypothesis["recommendation"] = "🔴 SELL"
-    else:
-        hypothesis["recommendation"] = "🟡 HOLD"
-    
-    hypothesis["confidence"] = confidence
-    hypothesis["net_score"] = round(net_score, 2)
-    
-    return hypothesis
+            ct = r.headers.get("content-type", "")
+            if "json" in ct.lower():
+                return r.json()
 
-# ==========================================
-# 11. PAGE SETUP
-# ==========================================
-st.set_page_config(
-    page_title="Ultimate Trading Dashboard",
-    layout="wide",
-    page_icon="📈",
-    initial_sidebar_state="collapsed"
-)
+            return r.json()
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-* { font-family: 'Inter', sans-serif; }
-[data-testid="stMetricValue"] { font-size: 1.3rem; font-weight: 700; }
-[data-testid="stMetric"] { background: #f8f9fa; border-radius: 10px; padding: 15px; border: 1px solid #e0e0e0; }
-h1, h2, h3 { color: #0a0e27; font-weight: 700; }
-.stAlert { border-radius: 10px; }
-</style>
-""", unsafe_allow_html=True)
+        except Exception:
+            if attempt == retries:
+                return None
+            time.sleep(0.5 * (attempt + 1))
 
-# ==========================================
-# 12. SESSION STATE
-# ==========================================
-if "alerts" not in st.session_state:
-    st.session_state.alerts = []
-if "notifications" not in st.session_state:
-    st.session_state.notifications = []
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = datetime.now(IST)
+    return None
 
-# ==========================================
-# 13. SIDEBAR
-# ==========================================
-st.sidebar.header("⚙️ Trading Dashboard Settings")
 
-refresh_seconds = st.sidebar.slider("Auto-Refresh (seconds)", 5, 120, 15, 5)
+@st.cache_data(ttl=180, show_spinner=False)
+def nse_json(path: str):
+    """
+    NSE cookie/session bootstrap + retry.
+    """
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
 
-if HAS_AUTOREFRESH:
-    st_autorefresh(interval=int(refresh_seconds * 1000), key="dash_refresh")
+    try:
+        s.get("https://www.nseindia.com/", timeout=8)
+    except Exception:
+        pass
 
-st.sidebar.markdown(f"🕒 **IST:** {datetime.now(IST).strftime('%H:%M:%S %d-%b')}")
+    return request_json(
+        f"https://www.nseindia.com{path}",
+        session=s,
+        timeout=10,
+        retries=2,
+    )
 
-is_market_open = MARKET_OPEN <= datetime.now(IST).time() <= MARKET_CLOSE and datetime.now(IST).weekday() < 5
-st.sidebar.markdown(f"{'🟢 मार्केट खुला' if is_market_open else '🔴 मार्केट बंद'}")
 
-selected_stocks = st.sidebar.multiselect("📊 Stock Watchlist", WATCHLIST, default=WATCHLIST[:15])
+# ================================================================
+# 4. YAHOO BATCH DOWNLOAD
+# ================================================================
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Scan Settings")
+@st.cache_data(ttl=120, show_spinner=False)
+def yf_batch(
+    symbols: Tuple[str, ...],
+    period: str,
+    interval: str,
+) -> Dict[str, pd.DataFrame]:
 
-trade_types = st.sidebar.multiselect(
-    "Trading Types",
-    ["Scalping (1-5m)", "Intraday (15m-4h)", "Swing (Daily)"],
-    default=["Intraday (15m-4h)"]
-)
+    if not symbols:
+        return {}
 
-show_signals = st.sidebar.checkbox("Show Technical Signals", value=True)
-show_zones = st.sidebar.checkbox("Show D&S Zones", value=True)
-show_news = st.sidebar.checkbox("Show Real News", value=True)
+    try:
+        raw = yf.download(
+            list(symbols),
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            threads=True,
+            auto_adjust=False,
+            progress=False,
+            timeout=15,
+        )
+    except Exception:
+        return {}
 
-if st.sidebar.button("🔄 Clear Cache"):
-    smart_cache.clear()
-    st.rerun()
+    result = {}
 
-# ==========================================
-# 14. MAIN DASHBOARD
-# ==========================================
+    if raw is None or raw.empty:
+        return result
 
-# Determine timeframes to scan based on trading type
-timeframes_to_scan = []
-if "Scalping (1-5m)" in trade_types:
-    timeframes_to_scan.extend(["1m", "3m", "5m"])
-if "Intraday (15m-4h)" in trade_types:
-    timeframes_to_scan.extend(["15m", "30m", "1h", "4h"])
-if "Swing (Daily)" in trade_types:
-    timeframes_to_scan.extend(["1d"])
-
-if not timeframes_to_scan:
-    st.warning("कृपया कम से कम एक trading type सलेक्ट करें।")
-    st.stop()
-
-# ==========================================
-# TAB 1: LIVE ALERTS & SIGNALS
-# ==========================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🔔 Live Alerts & Signals",
-    "🎯 AI Hypothesis",
-    "📰 News & Events",
-    "💰 Global Macro",
-    "📊 Detailed Analysis"
-])
-
-with tab1:
-    st.subheader("🔔 Real-Time Signals & D&S Zones")
-    
-    # Display notifications
-    if st.session_state.notifications:
-        st.info(f"📢 **Latest Notifications:** {len(st.session_state.notifications)}")
-        for notif in st.session_state.notifications[-5:]:
-            st.caption(f"🔔 {notif['time']} - {notif['title']}: {notif['message']}")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    signal_rows = []
-    total_stocks = len(selected_stocks)
-    
-    with st.spinner("⚡ Scanning all stocks for signals..."):
-        data = parallel_fetch_data(selected_stocks, timeframes_to_scan[0] if timeframes_to_scan else "15m")
-        
-        for idx, stock in enumerate(selected_stocks):
-            progress_bar.progress((idx + 1) / total_stocks)
-            status_text.text(f"Processing: {stock} ({idx+1}/{total_stocks})")
-            
-            if stock not in data:
-                continue
-            
-            stock_data = data[stock]
-            
-            # Handle tuple returns (multiple timeframes)
-            if isinstance(stock_data, tuple):
-                dfs_dict = {}
-                if len(stock_data) == 3:  # 1m data returns (1m, 3m, 15m)
-                    dfs_dict["1m"] = stock_data[0]
-                    dfs_dict["3m"] = stock_data[1]
-                    dfs_dict["15m"] = stock_data[2]
-                elif len(stock_data) == 2:  # 5m data returns (5m, 15m)
-                    dfs_dict["5m"] = stock_data[0]
-                    dfs_dict["15m"] = stock_data[1]
+    for symbol in symbols:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                # group_by=ticker
+                if symbol in raw.columns.get_level_values(0):
+                    df = raw[symbol].copy()
                 else:
-                    dfs_dict[timeframes_to_scan[0]] = stock_data[0]
+                    continue
             else:
-                dfs_dict = {timeframes_to_scan[0]: stock_data}
-            
-            for tf_key, df in dfs_dict.items():
-                if df is None or df.empty or len(df) < 15:
-                    continue
-                
-                # Get signals
-                signals = get_technical_signals(df)
-                if not signals:
-                    continue
-                
-                # Get D&S zones
-                zones = scan_ds_zones(df, tf_key)
-                
-                # Build signal string
-                signal_parts = []
-                if show_signals:
-                    if "ema_20_50" in signals:
-                        signal_parts.append(signals["ema_20_50"])
-                    if "vol_spike" in signals:
-                        signal_parts.append(signals["vol_spike"])
-                    if "rsi" in signals:
-                        signal_parts.append(signals["rsi"])
-                
-                if show_zones and zones:
-                    hq_zones = [z for z in zones if z.is_hq and z.state != "Filled"]
-                    if hq_zones:
-                        signal_parts.append(f"🚀 {len(hq_zones)} HQ Zone(s)")
-                    else:
-                        zone_count = sum(1 for z in zones if z.state != "Filled")
-                        if zone_count > 0:
-                            signal_parts.append(f"⭐ {zone_count} Zone(s)")
-                
-                if not signal_parts:
-                    continue
-                
-                signal_text = " | ".join(signal_parts)
-                price = signals.get("current_price", df['Close'].iloc[-1])
-                
-                # Determine signal quality
-                has_hq = any("🚀" in p for p in signal_parts)
-                has_multiple = len(signal_parts) >= 2
-                
-                if has_hq:
-                    stars = "🚀 HQ"
-                    color = "🟢" if "UP" in signal_text or "DEMAND" in signal_text else "🔴"
-                elif has_multiple:
-                    stars = "⭐⭐ Strong"
-                    color = "🟢" if "UP" in signal_text or "DEMAND" in signal_text else "🔴"
-                else:
-                    stars = "⭐ Signal"
-                    color = ""
-                
-                signal_rows.append({
-                    "Signal": stars,
-                    "Stock": stock,
-                    "TF": TIMEFRAMES_CONFIG[tf_key]["display"],
-                    "Type": signal_text,
-                    "Price": round(price, 2),
-                    "Time": df.index[-1].strftime("%H:%M"),
-                    "Chart": f"[Open](https://www.tradingview.com/chart/?symbol=NSE:{TV_FIX.get(stock, stock)})",
-                })
-                
-                # Send notification for HQ signals
-                if has_hq:
-                    send_notification(
-                        f"🚀 HQ Signal: {stock}",
-                        f"{signal_text} @ {price:.2f} ({tf_key})"
-                    )
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    if not signal_rows:
-        st.success("✅ अभी कोई सिग्नल नहीं मिला।")
-    else:
-        sig_df = pd.DataFrame(signal_rows)
-        
-        # Sort by signal quality
-        rank = {"🚀 HQ": 3, "⭐⭐ Strong": 2, "⭐ Signal": 1}
-        sig_df["_rank"] = sig_df["Signal"].map(rank)
-        sig_df = sig_df.sort_values(["_rank", "Time"], ascending=[False, False]).drop("_rank", axis=1)
-        
-        # Style dataframe
-        def style_signal(row):
-            colors = {
-                "🚀 HQ": "background-color: #d1e7dd; font-weight: bold;",
-                "⭐⭐ Strong": "background-color: #e8f4f8;",
-                "⭐ Signal": "background-color: #fff3cd;",
-            }
-            base = colors.get(row["Signal"], "")
-            return [base] * len(row)
-        
-        st.dataframe(
-            sig_df.style.apply(style_signal, axis=1),
-            use_container_width=True,
-            hide_index=True,
-            column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 Open")}
+                df = raw.copy()
+
+            needed = ["Open", "High", "Low", "Close", "Volume"]
+            available = [x for x in needed if x in df.columns]
+
+            if "Close" not in available:
+                continue
+
+            df = df[available].dropna(subset=["Close"])
+
+            if not df.empty:
+                result[symbol] = df
+
+        except Exception:
+            continue
+
+    return result
+
+
+# ================================================================
+# 5. INDICATORS
+# ================================================================
+
+def ema(arr: np.ndarray, period: int) -> np.ndarray:
+    if len(arr) == 0:
+        return arr
+
+    alpha = 2.0 / (period + 1)
+    out = np.empty(len(arr), dtype=float)
+    out[0] = arr[0]
+
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+
+    return out
+
+
+def atr_np(h, l, c, period=14):
+    n = len(c)
+
+    if n == 0:
+        return np.array([])
+
+    tr = np.empty(n)
+    tr[0] = h[0] - l[0]
+
+    if n > 1:
+        tr[1:] = np.maximum(
+            h[1:] - l[1:],
+            np.maximum(
+                abs(h[1:] - c[:-1]),
+                abs(l[1:] - c[:-1]),
+            ),
         )
 
-with tab2:
-    st.subheader("🎯 AI Buy/Sell Hypothesis — Real Market Data से")
-    
-    if st.button("▶️ Generate AI Hypothesis", key="gen_hyp"):
-        hypothesis_rows = []
-        
-        with st.spinner("🤖 Analyzing all stocks..."):
-            # Get macro data
-            quotes = get_quotes(["^GSPC", "CL=F", "DX-Y.NYB"])
-            sp500_pct = quotes.get("^GSPC", {}).get("pct", 0)
-            crude_pct = quotes.get("CL=F", {}).get("pct", 0)
-            dxy_pct = quotes.get("DX-Y.NYB", {}).get("pct", 0)
-            
-            nifty_data = fetch_nifty_pcr()
-            pcr = nifty_data.get("pcr", 1.0)
-            
-            macro_data = {
-                "sp500_pct": sp500_pct,
-                "crude_pct": crude_pct,
-                "dxy_pct": dxy_pct,
-                "pcr": pcr,
-            }
-            
-            # Fetch data and generate hypothesis
-            data = parallel_fetch_data(selected_stocks, timeframes_to_scan[0] if timeframes_to_scan else "1h")
-            
-            for stock in selected_stocks:
-                if stock not in data:
-                    continue
-                
-                stock_data = data[stock]
-                if isinstance(stock_data, tuple):
-                    df = stock_data[0]  # Use first dataframe
-                else:
-                    df = stock_data
-                
-                if df is None or df.empty or len(df) < 15:
-                    continue
-                
-                signals = get_technical_signals(df)
-                zones = scan_ds_zones(df)
-                news = fetch_stock_news(stock)
-                
-                price = signals.get("current_price", df['Close'].iloc[-1])
-                
-                hyp = generate_hypothesis(stock, price, signals, zones, news, macro_data)
-                
-                hypothesis_rows.append(hyp)
-        
-        # Display results
-        if not hypothesis_rows:
-            st.warning("कोई hypothesis नहीं बना सका।")
-        else:
-            # Split by recommendation
-            buy_hyp = [h for h in hypothesis_rows if "BUY" in h["recommendation"]]
-            sell_hyp = [h for h in hypothesis_rows if "SELL" in h["recommendation"]]
-            
-            col_buy, col_sell = st.columns(2)
-            
-            with col_buy:
-                st.markdown("### 🟢 BUY HYPOTHESIS")
-                buy_hyp.sort(key=lambda x: x["confidence"], reverse=True)
-                
-                if not buy_hyp:
-                    st.info("कोई BUY setup नहीं मिला।")
-                else:
-                    for h in buy_hyp[:5]:
-                        st.markdown(
-                            f"""
-                            <div style="background-color: #e6f4ea; border-radius: 10px; padding: 15px; margin-bottom: 10px; border: 2px solid #34a853;">
-                            <b style="font-size: 15px;">{h['stock']}</b> @ ₹{h['price']:.2f}
-                            <br><span style="font-size: 12px;">📊 Confidence: <b>{h['confidence']}%</b></span>
-                            <br><span style="font-size: 12px;">Score: {h['net_score']}</span>
-                            <br><small>{'<br>'.join(h['reasons'][:4])}</small>
-                            <br><small>Zones: {len(h['zones'])} | News: {len(h['news']) if 'news' in h else 0}</small>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-            
-            with col_sell:
-                st.markdown("### 🔴 SELL HYPOTHESIS")
-                sell_hyp.sort(key=lambda x: x["confidence"], reverse=True)
-                
-                if not sell_hyp:
-                    st.info("कोई SELL setup नहीं मिला।")
-                else:
-                    for h in sell_hyp[:5]:
-                        st.markdown(
-                            f"""
-                            <div style="background-color: #fce8e6; border-radius: 10px; padding: 15px; margin-bottom: 10px; border: 2px solid #ea4335;">
-                            <b style="font-size: 15px;">{h['stock']}</b> @ ₹{h['price']:.2f}
-                            <br><span style="font-size: 12px;">📊 Confidence: <b>{h['confidence']}%</b></span>
-                            <br><span style="font-size: 12px;">Score: {h['net_score']}</span>
-                            <br><small>{'<br>'.join(h['reasons'][:4])}</small>
-                            <br><small>Zones: {len(h['zones'])} | News: {len(h['news']) if 'news' in h else 0}</small>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
+    result = np.empty(n)
+    result[0] = tr[0]
+
+    alpha = 1 / period
+
+    for i in range(1, n):
+        result[i] = (
+            alpha * tr[i]
+            + (1 - alpha) * result[i - 1]
+        )
+
+    return result
+
+
+def rsi_value(close: np.ndarray, period=14):
+    if len(close) < period + 1:
+        return None
+
+    d = np.diff(close)
+    gains = np.maximum(d, 0)
+    losses = np.maximum(-d, 0)
+
+    ag = gains[-period:].mean()
+    al = losses[-period:].mean()
+
+    if al == 0:
+        return 100.0
+
+    rs = ag / al
+    return 100 - 100 / (1 + rs)
+
+
+def technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or len(df) < 55:
+        return {}
+
+    close = df["Close"].to_numpy(float)
+    volume = df["Volume"].to_numpy(float)
+
+    e3 = ema(close, 3)
+    e5 = ema(close, 5)
+    e20 = ema(close, 20)
+    e50 = ema(close, 50)
+
+    rsi = rsi_value(close)
+
+    vol_ratio = 0
+    if len(volume) >= 21:
+        base = np.mean(volume[-21:-1])
+        if base > 0:
+            vol_ratio = volume[-1] / base
+
+    score = 0.0
+    reasons = []
+
+    if e20[-1] > e50[-1]:
+        score += 1.2
+        reasons.append("EMA20 > EMA50")
     else:
-        st.info("💡 **Generate AI Hypothesis** बटन पर क्लिक करके real market data से BUY/SELL setup देखें।")
+        score -= 1.2
+        reasons.append("EMA20 < EMA50")
 
-with tab3:
-    st.subheader("📰 Real News & Market Events")
-    
-    # Get announcements
-    announcements = fetch_nse_announcements()
-    
-    # Get market events
-    events = fetch_market_events()
-    
-    col_news, col_events = st.columns(2)
-    
-    with col_news:
-        st.markdown("### 📢 Corporate Announcements")
-        if not announcements:
-            st.info("अभी कोई announcement नहीं।")
-        else:
-            for ann in announcements[:10]:
-                if ann["symbol"] in selected_stocks:
-                    st.markdown(
-                        f"""
-                        <div style="background-color: #f8f9fa; border-radius: 8px; padding: 10px; margin-bottom: 8px; border-left: 4px solid #0066cc;">
-                        <b style="color: #0066cc;">{ann['symbol']}</b> — {ann['time']}
-                        <br><small>{ann['subject']}</small>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-    
-    with col_events:
-        st.markdown("### 🌍 Market Events (Today)")
-        if not events:
-            st.info("कोई high-impact event नहीं।")
-        else:
-            for evt in events[:10]:
-                impact_color = {"High": "#ea4335", "Medium": "#fbbc04"}.get(.get["impact"], "#555")
-                st.markdown(
-                    f"""
-                    <div style="background-color: #fef7e0; border-radius: 8px; padding: 10px; margin-bottom: 8px; border-left: 4px solid {impact_color};">
-                    <b style="color: {impact_color};">{evt['country']}</b> — {evt['time']}
-                    <br><small>{evt['event']}</small>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
+    if e3[-1] > e5[-1]:
+        score += 0.4
+        reasons.append("Short momentum bullish")
+    else:
+        score -= 0.4
+        reasons.append("Short momentum bearish")
+
+    if rsi is not None:
+        if 52 <= rsi <= 68:
+            score += 0.5
+        elif 32 <= rsi <= 48:
+            score -= 0.5
+        elif rsi >= 75:
+            score -= 0.3
+            reasons.append("RSI stretched")
+        elif rsi <= 25:
+            score += 0.3
+            reasons.append("RSI oversold")
+
+    return {
+        "score": score,
+        "rsi": rsi,
+        "volume_ratio": vol_ratio,
+        "price": close[-1],
+        "reasons": reasons,
+    }
+
+
+# ================================================================
+# 6. CONFIRMED PIVOTS - NO LOOKAHEAD
+# ================================================================
+
+def confirmed_pivots(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    left=5,
+    right=5,
+):
+    """
+    Signal becomes available only at pivot_index + right.
+
+    This avoids making a historical pivot available before
+    the right-side candles actually existed.
+    """
+
+    n = len(highs)
+
+    available_high = np.full(n, np.nan)
+    available_low = np.full(n, np.nan)
+
+    for pivot_i in range(left, n - right):
+        hwin = highs[pivot_i-left:pivot_i+right+1]
+        lwin = lows[pivot_i-left:pivot_i+right+1]
+
+        confirmation_i = pivot_i + right
+
+        if (
+            highs[pivot_i] == np.max(hwin)
+            and np.sum(hwin == highs[pivot_i]) == 1
+        ):
+            available_high[confirmation_i] = highs[pivot_i]
+
+        if (
+            lows[pivot_i] == np.min(lwin)
+            and np.sum(lwin == lows[pivot_i]) == 1
+        ):
+            available_low[confirmation_i] = lows[pivot_i]
+
+    return available_high, available_low
+
+
+# ================================================================
+# 7. D&S ENGINE
+# ================================================================
+
+@dataclass
+class Zone:
+    prox: float
+    distal: float
+    sl: float
+    tp: float
+    demand: bool
+    score: int
+    created_idx: int
+
+    state: str = "Fresh"
+    touches: int = 0
+
+
+def base_overlap_ok(high, low):
+    if len(high) <= 1:
+        return True
+
+    for i in range(1, len(high)):
+        overlap = min(high[i-1], high[i]) - max(low[i-1], low[i])
+        min_range = min(
+            high[i-1] - low[i-1],
+            high[i] - low[i],
+        )
+
+        if min_range <= 0:
+            return False
+
+        if overlap / min_range < BASE_MIN_OVERLAP:
+            return False
+
+    return True
+
+
+def strong_close(o, h, l, c, bull):
+    rng = h - l
+
+    if rng <= 0:
+        return False
+
+    if bull:
+        return (c - l) / rng >= 0.70
+
+    return (h - c) / rng >= 0.70
+
+
+def scan_ds(df: pd.DataFrame) -> List[Zone]:
+    if df is None or len(df) < 40:
+        return []
+
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    c = df["Close"].to_numpy(float)
+    v = df["Volume"].to_numpy(float)
+
+    n = len(c)
+
+    atr = atr_np(h, l, c, ATR_PERIOD)
+    tr = h - l
+
+    bull = c > o
+    bear = c < o
+
+    body = abs(c - o)
+
+    body_hi = np.maximum(o, c)
+    body_lo = np.minimum(o, c)
+
+    wick = (h - body_hi) + (body_lo - l)
+
+    wick_pct = np.divide(
+        wick,
+        tr,
+        out=np.zeros(n),
+        where=tr > 0,
+    )
+
+    ph_available, pl_available = confirmed_pivots(h, l)
+
+    last_swing_high = np.nan
+    last_swing_low = np.nan
+
+    zones = []
+
+    for i in range(25, n):
+
+        # Confirmed only now
+        if not np.isnan(ph_available[i]):
+            last_swing_high = ph_available[i]
+
+        if not np.isnan(pl_available[i]):
+            last_swing_low = pl_available[i]
+
+        new_zone = None
+
+        for base_count in range(MIN_BASE, MAX_BASE + 1):
+
+            legout = i
+            legin = i - base_count - 1
+
+            if legin < 20:
+                continue
+
+            bs = slice(legin + 1, legout)
+
+            bh = h[bs]
+            bl = l[bs]
+            bo = o[bs]
+            bc = c[bs]
+            bv = v[bs]
+            btr = tr[bs]
+            batr = atr[bs]
+
+            if len(bh) == 0:
+                continue
+
+            # Tight base
+            if not np.all(btr <= MAX_BASE_ATR_MULT * batr):
+                continue
+
+            # Small bodies
+            ranges = bh - bl
+
+            ratios = np.divide(
+                abs(bc - bo),
+                ranges,
+                out=np.zeros(len(ranges)),
+                where=ranges > 0,
+            )
+
+            if np.any(ratios > BASE_MAX_BODY_RATIO):
+                continue
+
+            if not base_overlap_ok(bh, bl):
+                continue
+
+            if np.mean(bv) > v[legin]:
+                continue
+
+            legout_direction_bull = bull[legout]
+
+            if not strong_close(
+                o[legin],
+                h[legin],
+                l[legin],
+                c[legin],
+                bull[legin],
+            ):
+                continue
+
+            if tr[legout] < LEG_OUT_ATR_MULT * atr[legout]:
+                continue
+
+            if wick_pct[legout] > MAX_WICK_PCT:
+                continue
+
+            if not (
+                tr[legout] > tr[legin] > np.max(btr)
+            ):
+                continue
+
+            avg20 = np.mean(v[max(0, legout-20):legout])
+
+            if avg20 <= 0:
+                continue
+
+            if v[legout] < LEG_OUT_VOL_MULT * avg20:
+                continue
+
+            base_high = float(np.max(bh))
+            base_low = float(np.min(bl))
+
+            if legout_direction_bull:
+                bos = c[legout] > max(h[legin], base_high)
+
+                sweep = (
+                    not np.isnan(last_swing_low)
+                    and min(base_low, l[legin]) < last_swing_low
                 )
-    
-    st.markdown("---")
-    st.markdown("### 📰 Stock-Specific News")
-    
-    for stock in selected_stocks[:10]:
-        news = fetch_stock_news(stock)
-        if news:
-            with st.expander(f"📰 {stock} News"):
-                for n in news:
-                    st.markdown(
-                        f"[{n['title']}]({n['link']}) — {n['published']}"
+
+                if not bos:
+                    continue
+
+                prox = base_high
+                distal = base_low
+
+            else:
+                bos = c[legout] < min(l[legin], base_low)
+
+                sweep = (
+                    not np.isnan(last_swing_high)
+                    and max(base_high, h[legin]) > last_swing_high
+                )
+
+                if not bos:
+                    continue
+
+                prox = base_low
+                distal = base_high
+
+            score = 50
+
+            if tr[legout] >= HQ_LEG_OUT_ATR * atr[legout]:
+                score += 20
+
+            if sweep:
+                score += 20
+
+            if base_count <= 2:
+                score += 10
+
+            sl = (
+                distal - SL_ATR_BUFFER * atr[legout]
+                if legout_direction_bull
+                else distal + SL_ATR_BUFFER * atr[legout]
+            )
+
+            risk = abs(prox - sl)
+
+            tp = (
+                prox + TARGET_RR * risk
+                if legout_direction_bull
+                else prox - TARGET_RR * risk
+            )
+
+            duplicate = any(
+                z.demand == legout_direction_bull
+                and abs(z.prox - prox) < atr[legout] * 0.25
+                for z in zones[-10:]
+            )
+
+            if not duplicate:
+                new_zone = Zone(
+                    prox=prox,
+                    distal=distal,
+                    sl=sl,
+                    tp=tp,
+                    demand=legout_direction_bull,
+                    score=score,
+                    created_idx=i,
+                )
+
+                zones.append(new_zone)
+
+            break
+
+        # IMPORTANT BUG FIX:
+        # only pre-existing zones can be touched on this candle.
+        # Newly-created formation candle cannot instantly retest itself.
+
+        for z in zones:
+
+            if z.created_idx >= i:
+                continue
+
+            if z.state == "Filled":
+                continue
+
+            if z.demand:
+                touched = l[i] <= z.prox
+                consumed = l[i] <= z.distal
+            else:
+                touched = h[i] >= z.prox
+                consumed = h[i] >= z.distal
+
+            if consumed:
+                z.state = "Filled"
+
+            elif touched:
+                z.state = "Retest"
+                z.touches += 1
+
+    return zones
+
+
+def nearest_ds_score(df):
+    zones = scan_ds(df)
+
+    if not zones:
+        return 0.0, None
+
+    price = float(df["Close"].iloc[-1])
+
+    best = None
+    best_distance = float("inf")
+
+    for z in zones:
+
+        if z.state == "Filled":
+            continue
+
+        distance = abs(price - z.prox) / max(z.prox, 1e-9)
+
+        if distance < best_distance:
+            best = z
+            best_distance = distance
+
+    if best is None:
+        return 0.0, None
+
+    # only relevant within 2%
+    if best_distance > 0.02:
+        return 0.0, None
+
+    quality = best.score / 100
+
+    # stronger as price approaches zone
+    proximity = max(0.3, 1 - best_distance / 0.02)
+
+    score = quality * proximity * 2.5
+
+    if best.demand:
+        return score, best
+
+    return -score, best
+
+
+# ================================================================
+# 8. NEWS ENGINE
+# ================================================================
+
+POSITIVE_WORDS = {
+    "wins", "order", "growth", "profit", "upgrade",
+    "approval", "approved", "record", "expansion",
+    "acquisition", "dividend", "buyback", "strong",
+    "beats", "surge", "partnership", "contract",
+}
+
+NEGATIVE_WORDS = {
+    "loss", "fraud", "downgrade", "probe", "penalty",
+    "default", "weak", "misses", "decline", "fall",
+    "lawsuit", "investigation", "warning", "cuts",
+    "slump", "fire", "accident",
+}
+
+
+def headline_sentiment(title: str) -> float:
+    """
+    Conservative lexical event classifier.
+    Not pretending to be an LLM sentiment model.
+    """
+
+    text = re.sub(r"[^a-zA-Z ]", " ", title.lower())
+    words = set(text.split())
+
+    pos = len(words & POSITIVE_WORDS)
+    neg = len(words & NEGATIVE_WORDS)
+
+    raw = pos - neg
+
+    return float(np.clip(raw * 0.35, -1.0, 1.0))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def stock_news(symbol: str):
+    if feedparser is None:
+        return []
+
+    query = urllib.parse.quote_plus(
+        f'"{symbol}" NSE OR India stock when:1d'
+    )
+
+    url = (
+        "https://news.google.com/rss/search?"
+        f"q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    )
+
+    try:
+        r = requests.get(
+            url,
+            headers=NSE_HEADERS,
+            timeout=8,
+        )
+
+        feed = feedparser.parse(r.content)
+
+        result = []
+
+        for e in feed.entries[:5]:
+
+            title = e.get("title", "").strip()
+
+            if not title:
+                continue
+
+            result.append({
+                "title": title,
+                "url": e.get("link", ""),
+                "sentiment": headline_sentiment(title),
+            })
+
+        return result
+
+    except Exception:
+        return []
+
+
+def fetch_all_news(stocks):
+    result = {}
+
+    workers = min(12, max(1, len(stocks)))
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers
+    ) as pool:
+
+        fut = {
+            pool.submit(stock_news, s): s
+            for s in stocks
+        }
+
+        for f in concurrent.futures.as_completed(fut):
+
+            s = fut[f]
+
+            try:
+                result[s] = f.result()
+            except Exception:
+                result[s] = []
+
+    return result
+
+
+def news_score(news):
+    if not news:
+        return 0.0
+
+    values = [
+        n["sentiment"]
+        for n in news[:3]
+    ]
+
+    if not values:
+        return 0
+
+    # Recent headlines matter but capped
+    return float(
+        np.clip(
+            np.mean(values) * 1.5,
+            -1.5,
+            1.5,
+        )
+    )
+
+
+# ================================================================
+# 9. FII/DII
+# ================================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_fii_dii():
+    data = nse_json("/api/fiidiiTradeReact")
+
+    if not data:
+        return {
+            "fii": 0.0,
+            "dii": 0.0,
+            "available": False,
+        }
+
+    fii = 0
+    dii = 0
+
+    try:
+        for row in data:
+
+            category = str(
+                row.get("category", "")
+            ).upper()
+
+            value = safe_float(
+                row.get(
+                    "netValue",
+                    row.get("netvalue", 0),
+                )
+            )
+
+            if "FII" in category or "FPI" in category:
+                fii = value
+
+            elif "DII" in category:
+                dii = value
+
+        return {
+            "fii": fii,
+            "dii": dii,
+            "available": True,
+        }
+
+    except Exception:
+        return {
+            "fii": 0,
+            "dii": 0,
+            "available": False,
+        }
+
+
+# ================================================================
+# 10. OPTION CHAIN
+# ================================================================
+
+def parse_option_chain(data):
+    if not data:
+        return {}
+
+    try:
+        records = data["records"]["data"]
+
+        call_total = 0
+        put_total = 0
+
+        call_map = {}
+        put_map = {}
+
+        call_change = 0
+        put_change = 0
+
+        for r in records:
+
+            strike = r.get("strikePrice")
+
+            ce = r.get("CE")
+            pe = r.get("PE")
+
+            if ce:
+                oi = safe_float(ce.get("openInterest"))
+                coi = safe_float(ce.get("changeinOpenInterest"))
+
+                call_total += oi
+                call_change += coi
+
+                call_map[strike] = (
+                    call_map.get(strike, 0) + oi
+                )
+
+            if pe:
+                oi = safe_float(pe.get("openInterest"))
+                poi = safe_float(pe.get("changeinOpenInterest"))
+
+                put_total += oi
+                put_change += poi
+
+                put_map[strike] = (
+                    put_map.get(strike, 0) + oi
+                )
+
+        pcr = (
+            put_total / call_total
+            if call_total > 0
+            else None
+        )
+
+        support = (
+            max(put_map, key=put_map.get)
+            if put_map else None
+        )
+
+        resistance = (
+            max(call_map, key=call_map.get)
+            if call_map else None
+        )
+
+        underlying = safe_float(
+            data.get(
+                "records",
+                {}
+            ).get(
+                "underlyingValue",
+                0
+            )
+        )
+
+        return {
+            "pcr": pcr,
+            "call_oi": call_total,
+            "put_oi": put_total,
+            "call_change_oi": call_change,
+            "put_change_oi": put_change,
+            "support": support,
+            "resistance": resistance,
+            "spot": underlying,
+        }
+
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def nifty_option_chain():
+    return parse_option_chain(
+        nse_json(
+            "/api/option-chain-indices?symbol=NIFTY"
+        )
+    )
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def stock_option_chain(symbol):
+    data = nse_json(
+        f"/api/option-chain-equities?symbol="
+        f"{urllib.parse.quote(symbol)}"
+    )
+
+    return parse_option_chain(data)
+
+
+def option_score(oc):
+    """
+    PCR is context, not a standalone directional certainty.
+    Change-in-OI is included to avoid using only absolute OI.
+    """
+
+    if not oc:
+        return 0.0, []
+
+    score = 0
+    reasons = []
+
+    pcr = oc.get("pcr")
+
+    if pcr is not None:
+
+        if 1.05 <= pcr <= 1.6:
+            score += 0.7
+            reasons.append(f"PCR {pcr:.2f} supportive")
+
+        elif pcr < 0.75:
+            score -= 0.7
+            reasons.append(f"PCR {pcr:.2f} call-heavy")
+
+        elif pcr > 1.8:
+            # Extreme PCR should not automatically be interpreted
+            # as strongly bullish.
+            reasons.append(f"PCR extreme {pcr:.2f}")
+
+    pcoi = oc.get("put_change_oi", 0)
+    ccoi = oc.get("call_change_oi", 0)
+
+    denom = abs(pcoi) + abs(ccoi)
+
+    if denom > 0:
+        delta_bias = (pcoi - ccoi) / denom
+
+        score += np.clip(
+            delta_bias,
+            -0.6,
+            0.6,
+        )
+
+    return float(score), reasons
+
+
+# ================================================================
+# 11. GLOBAL MACRO
+# ================================================================
+
+@st.cache_data(ttl=180, show_spinner=False)
+def global_macro():
+    symbols = tuple(
+        GLOBAL_SYMBOLS.values()
+    )
+
+    data = yf_batch(
+        symbols,
+        "5d",
+        "1d",
+    )
+
+    result = {}
+
+    for name, ticker in GLOBAL_SYMBOLS.items():
+
+        df = data.get(ticker)
+
+        if df is None or len(df) < 2:
+            continue
+
+        last = safe_float(df["Close"].iloc[-1])
+        prev = safe_float(df["Close"].iloc[-2])
+
+        pct = (
+            (last - prev) / prev * 100
+            if prev else 0
+        )
+
+        result[name] = {
+            "price": last,
+            "pct": pct,
+        }
+
+    return result
+
+
+def macro_score_for_stock(
+    symbol: str,
+    macro: Dict[str, Any],
+):
+    score = 0.0
+    reasons = []
+
+    sp = macro.get("S&P500", {}).get("pct", 0)
+    nasdaq = macro.get("NASDAQ", {}).get("pct", 0)
+    dxy = macro.get("DXY", {}).get("pct", 0)
+    crude = macro.get("Crude", {}).get("pct", 0)
+    us10 = macro.get("US10Y", {}).get("pct", 0)
+    usdinr = macro.get("USDINR", {}).get("pct", 0)
+    copper = macro.get("Copper", {}).get("pct", 0)
+
+    # Broad risk
+    if sp > 0.5:
+        score += 0.25
+
+    elif sp < -0.5:
+        score -= 0.25
+
+    if dxy > 0.4:
+        score -= 0.20
+        reasons.append("Strong DXY risk")
+
+    elif dxy < -0.4:
+        score += 0.15
+
+    if us10 > 1:
+        score -= 0.15
+
+    # IT/export
+    IT = {
+        "TCS", "INFY", "HCLTECH",
+        "WIPRO", "TECHM",
+    }
+
+    if symbol in IT:
+
+        if nasdaq > 0.5:
+            score += 0.45
+            reasons.append("NASDAQ positive")
+
+        elif nasdaq < -0.5:
+            score -= 0.45
+            reasons.append("NASDAQ weak")
+
+        if usdinr > 0.20:
+            score += 0.25
+            reasons.append("Weak INR supports exporters")
+
+    # Oil
+    UPSTREAM = {"ONGC"}
+    OMC = {"IOC", "BPCL"}
+
+    if symbol in UPSTREAM:
+
+        if crude > 1:
+            score += 0.45
+
+        elif crude < -1:
+            score -= 0.45
+
+    if symbol in OMC:
+
+        if crude < -1:
+            score += 0.45
+
+        elif crude > 1:
+            score -= 0.45
+
+    # Metals
+    METALS = {
+        "TATASTEEL",
+        "JSWSTEEL",
+        "HINDALCO",
+    }
+
+    if symbol in METALS:
+
+        if copper > 1:
+            score += 0.4
+            reasons.append("Base metals supportive")
+
+        elif copper < -1:
+            score -= 0.4
+
+    return score, reasons
+
+
+# ================================================================
+# 12. INDIA ECONOMIC EVENTS
+# ================================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def india_events_today():
+    """
+    ForexFactory public calendar feed is used as one source.
+    If unavailable, engine fails neutral instead of inventing data.
+    """
+
+    url = (
+        "https://nfs.faireconomy.media/"
+        "ff_calendar_thisweek.json"
+    )
+
+    try:
+        r = requests.get(
+            url,
+            headers=NSE_HEADERS,
+            timeout=10,
+        )
+
+        r.raise_for_status()
+
+        events = r.json()
+
+    except Exception:
+        return []
+
+    today = now_ist().date()
+
+    out = []
+
+    for event in events:
+
+        country = str(
+            event.get("country", "")
+        ).upper()
+
+        if country not in {"IN", "IND"}:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(
+                event["date"].replace(
+                    "Z",
+                    "+00:00",
+                )
+            ).astimezone(IST)
+
+        except Exception:
+            continue
+
+        if dt.date() != today:
+            continue
+
+        out.append({
+            "title": event.get("title", ""),
+            "impact": event.get("impact", ""),
+            "time": dt.strftime("%H:%M"),
+            "forecast": event.get("forecast", ""),
+            "previous": event.get("previous", ""),
+        })
+
+    return out
+
+
+def india_event_risk(events):
+    """
+    Economic-calendar events are treated primarily as uncertainty/risk.
+    Without actual-vs-forecast data, assigning bullish/bearish direction
+    would be misleading.
+    """
+
+    high = sum(
+        1 for e in events
+        if str(e["impact"]).lower() == "high"
+    )
+
+    medium = sum(
+        1 for e in events
+        if str(e["impact"]).lower() == "medium"
+    )
+
+    if high:
+        return "HIGH", high, medium
+
+    if medium:
+        return "MEDIUM", high, medium
+
+    return "LOW", high, medium
+
+
+# ================================================================
+# 13. TIMEFRAME DATA
+# ================================================================
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_tf(
+    stocks: Tuple[str, ...],
+    tf_name: str,
+):
+    cfg = TIMEFRAMES[tf_name]
+
+    mapping = {
+        s: yf_stock(s)
+        for s in stocks
+    }
+
+    data = yf_batch(
+        tuple(mapping.values()),
+        cfg["period"],
+        cfg["interval"],
+    )
+
+    out = {}
+
+    for stock, ticker in mapping.items():
+
+        df = data.get(ticker)
+
+        if df is None or df.empty:
+            continue
+
+        df = df.copy()
+
+        if cfg["resample"]:
+
+            try:
+                df = df.resample(
+                    cfg["resample"]
+                ).agg({
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }).dropna()
+
+            except Exception:
+                continue
+
+        if len(df) >= 55:
+            out[stock] = df
+
+    return out
+
+
+def fetch_timeframes_parallel(
+    stocks,
+    timeframes,
+):
+    results = {}
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(6, len(timeframes))
+    ) as ex:
+
+        futures = {
+            ex.submit(
+                fetch_tf,
+                tuple(stocks),
+                tf,
+            ): tf
+            for tf in timeframes
+        }
+
+        for fut in concurrent.futures.as_completed(
+            futures
+        ):
+
+            tf = futures[fut]
+
+            try:
+                results[tf] = fut.result()
+
+            except Exception:
+                results[tf] = {}
+
+    return results
+
+
+# ================================================================
+# 14. HYPOTHESIS MODEL
+# ================================================================
+
+TF_WEIGHT = {
+    "5 Min": 0.5,
+    "15 Min": 0.8,
+    "1 Hour": 1.3,
+    "Daily": 1.8,
+}
+
+
+def confidence_from_score(
+    score,
+    sources,
+    event_risk,
+):
+    """
+    Confidence is heuristic calibration, not statistical probability.
+    """
+
+    raw = (
+        45
+        + min(abs(score) * 7, 35)
+        + min(sources * 2, 10)
+    )
+
+    if event_risk == "HIGH":
+        raw -= 8
+
+    elif event_risk == "MEDIUM":
+        raw -= 3
+
+    return int(
+        np.clip(raw, 35, 92)
+    )
+
+
+def build_hypothesis(
+    stocks,
+    tf_data,
+    all_news,
+    stock_oi,
+    nifty_oi,
+    macro,
+    fii_dii,
+    india_events,
+):
+    output = []
+
+    event_risk, high_events, medium_events = (
+        india_event_risk(india_events)
+    )
+
+    nifty_score, nifty_reasons = (
+        option_score(nifty_oi)
+    )
+
+    fii_score = 0
+
+    if fii_dii["available"]:
+
+        if fii_dii["fii"] > 500:
+            fii_score += 0.35
+
+        elif fii_dii["fii"] < -500:
+            fii_score -= 0.35
+
+    for stock in stocks:
+
+        total = 0.0
+        bullish = []
+        bearish = []
+        sources = 0
+
+        # --------------------------------
+        # Technical + D&S MTF
+        # --------------------------------
+
+        for tf, stock_map in tf_data.items():
+
+            df = stock_map.get(stock)
+
+            if df is None:
+                continue
+
+            tech = technical_snapshot(df)
+
+            if tech:
+                s = (
+                    tech["score"]
+                    * TF_WEIGHT.get(tf, 1)
+                )
+
+                total += s
+                sources += 1
+
+                if s > 0:
+                    bullish.append(
+                        f"{tf} technical"
                     )
 
-with tab4:
-    st.subheader("💰 Global Macro Data")
-    
-    # Fetch quotes
-    quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
-    
-    # Nifty data
-    nifty_data = fetch_nifty_pcr()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        sp500 = quotes.get("^GSPC", {})
-        st.metric("S&P 500", f"{sp500.get('price', 'N/A'):.0f}", f"{sp500.get('pct', 0):+.2f}%")
-    
-    with col2:
-        crude = quotes.get("CL=F", {})
-        st.metric("Crude Oil", f"${crude.get('price', 'N/A'):.2f}", f"{crude.get('pct', 0):+.2f}%")
-    
-    with col3:
-        dxy = quotes.get("DX-Y.NYB", {})
-        st.metric("DXY", f"{dxy.get('price', 'N/A'):.2f}", f"{dxy.get('pct', 0):+.2f}%")
-    
-    with col4:
-        usdinr = quotes.get("INR=X", {})
-        st.metric("USD/INR", f"{usdinr.get('price', 'N/A'):.2f}", f"{usdinr.get('pct', 0):+.2f}%")
-    
-    st.markdown("---")
-    
-    col_nifty, col_macro = st.columns(2)
-    
-    with col_nifty:
-        st.markdown("### 🎯 Nifty Option Data")
-        st.metric("Spot", f"{nifty_data.get('spot', 'N/A'):.0f}")
-        st.metric("PCR (OI)", f"{nifty_data.get('pcr', 'N/A')}")
-        st.metric("Call Support", nifty_data.get('call_support', 'N/A'))
-        st.metric("Put Support", nifty_data.get('put_support', 'N/A'))
-    
-    with col_macro:
-        st.markdown("### 🌍 Market Interpretation")
-        
-        sp500_pct = quotes.get("^GSPC", {}).get("pct", 0)
-        crude_pct = quotes.get("CL=F", {}).get("pct", 0)
-        dxy_pct = quotes.get("DX-Y.NYB", {}).get("pct", 0)
-        pcr = nifty_data.get("pcr", 1.0)
-        
-        interpretation = []
-        
-        if sp500_pct > 0.5:
-            interpretation.append("🟢 Global bullish (US stocks strong)")
-        elif sp500_pct < -0.5:
-            interpretation.append("🔴 Global bearish (US stocks weak)")
-        
-        if crude_pct < -1:
-            interpretation.append("🟢 Crude down (Good for importers)")
-        elif crude_pct > 1:
-            interpretation.append("🔴 Crude up (Bad for importers)")
-        
-        if dxy_pct > 0.3:
-            interpretation.append("🔴 Rupee under pressure (Dollar strong)")
-        elif dxy_pct < -0.3:
-            interpretation.append("🟢 Rupee strength (Dollar weak)")
-        
-        if pcr > 1.2:
-            interpretation.append("🟢 PCR High (Put writers bullish)")
-        elif pcr < 0.8:
-            interpretation.append("🔴 PCR Low (Call writers bearish)")
-        
-        if interpretation:
-            for item in interpretation:
-                st.info(item)
-        else:
-            st.info("🟡 Macro data neutral — no strong signals")
+                elif s < 0:
+                    bearish.append(
+                        f"{tf} technical"
+                    )
 
-with tab5:
-    st.subheader("📊 Detailed Stock Analysis")
-    
-    selected_for_detail = st.selectbox("Select Stock for Analysis", selected_stocks)
-    
-    if st.button("▶️ Analyze"):
-        with st.spinner(f"Analyzing {selected_for_detail}..."):
-            # Fetch data for all timeframes
-            tf_data = {}
-            for tf_key in timeframes_to_scan:
-                tf_cfg = TIMEFRAMES_CONFIG[tf_key]
-                result = get_stock_data(selected_for_detail, tf_cfg["period"], tf_cfg["yf"])
-                
-                if result:
-                    if isinstance(result, tuple):
-                        # For 1m with 3m/15m resampling
-                        tf_data[tf_key] = result[0]  # Use base timeframe
+            # D&S: more expensive; use H1/Daily
+            # for hypothesis quality/performance balance.
+            if tf in {"1 Hour", "Daily"}:
+
+                ds_s, zone = nearest_ds_score(df)
+
+                ds_s *= TF_WEIGHT[tf]
+
+                total += ds_s
+
+                if zone:
+                    sources += 1
+
+                    text = (
+                        f"{tf} Demand "
+                        if zone.demand
+                        else f"{tf} Supply "
+                    )
+
+                    text += (
+                        f"{zone.prox:.2f}"
+                    )
+
+                    if ds_s > 0:
+                        bullish.append(text)
                     else:
-                        tf_data[tf_key] = result
-            
-            if not tf_data:
-                st.error(f"कोई data नहीं मिला {selected_for_detail} के लिए।")
-            else:
-                # Display analysis for each timeframe
-                for tf_key in timeframes_to_scan:
-                    if tf_key not in tf_data:
-                        continue
-                    
-                    df = tf_data[tf_key]
-                    tf_display = TIMEFRAMES_CONFIG[tf_key]["display"]
-                    
-                    with st.expander(f"📊 {tf_display} Analysis"):
-                        col_price, col_signal, col_zone = st.columns(3)
-                        
-                        with col_price:
-                            st.metric("Current Price", f"₹{df['Close'].iloc[-1]:.2f}")
-                            chg = df['Close'].iloc[-1] - df['Close'].iloc[-2]
-                            pct = (chg / df['Close'].iloc[-2]) * 100
-                            st.metric("Change", f"{chg:+.2f} ({pct:+.2f}%)")
-                        
-                        with col_signal:
-                            signals = get_technical_signals(df)
-                            st.metric("EMA 20/50", signals.get("ema_20_50", "—"))
-                            st.metric("RSI (14)", f"{signals.get('rsi_value', 0):.0f}")
-                        
-                        with col_zone:
-                            zones = scan_ds_zones(df, tf_key)
-                            active_zones = [z for z in zones if z.state != "Filled"]
-                            
-                            if active_zones:
-                                st.metric("Active Zones", len(active_zones))
-                                hq = sum(1 for z in active_zones if z.is_hq)
-                                st.metric("HQ Zones", hq)
-                            else:
-                                st.info("No active zones")
-                        
-                        # Display zones
-                        if active_zones:
-                            st.markdown("**Demand/Supply Zones:**")
-                            for z in active_zones:
-                                zone_data = z.to_dict()
-                                badge = "🚀 HQ" if z.is_hq else "⭐"
-                                side_emoji = "🟢" if z.is_demand else "🔴"
-                                st.caption(
-                                    f"{side_emoji} {badge} {zone_data['Side']} @ {zone_data['Entry']} "
-                                    f"| SL: {zone_data['SL']} | TP: {zone_data['TP']} | {zone_data['State']}"
-                                )
+                        bearish.append(text)
 
-# ==========================================
-# FOOTER
-# ==========================================
-st.markdown("---")
-st.caption(
-    f"🤖 **Ultimate Trading Dashboard** | "
-    f"⚡ Auto-Refresh: {refresh_seconds}s | "
-    f"📊 Stocks: {len(selected_stocks)} | "
-    f"🔔 Alerts: {len(st.session_state.alerts)} | "
-    f"⏰ Last Update: {st.session_state.last_refresh.strftime('%H:%M:%S')}"
+        # --------------------------------
+        # Current stock news
+        # --------------------------------
+
+        ns = news_score(
+            all_news.get(stock, [])
+        )
+
+        total += ns
+
+        if all_news.get(stock):
+            sources += 1
+
+            if ns > 0.15:
+                bullish.append(
+                    "Positive current news/event"
+                )
+
+            elif ns < -0.15:
+                bearish.append(
+                    "Negative current news/event"
+                )
+
+        # --------------------------------
+        # Stock Option OI / PCR
+        # --------------------------------
+
+        oi = stock_oi.get(stock, {})
+
+        oi_score, oi_reasons = option_score(oi)
+
+        total += oi_score * 1.2
+
+        if oi:
+            sources += 1
+
+        if oi_score > 0.15:
+            bullish.extend(oi_reasons[:1])
+
+        elif oi_score < -0.15:
+            bearish.extend(oi_reasons[:1])
+
+        # --------------------------------
+        # Nifty market OI
+        # --------------------------------
+
+        total += nifty_score * 0.45
+
+        if nifty_oi:
+            sources += 1
+
+        # --------------------------------
+        # FII
+        # --------------------------------
+
+        total += fii_score
+
+        if fii_dii["available"]:
+            sources += 1
+
+        # --------------------------------
+        # Macro - stock sensitive
+        # --------------------------------
+
+        ms, mr = macro_score_for_stock(
+            stock,
+            macro,
+        )
+
+        total += ms
+
+        if mr:
+            sources += 1
+
+            if ms > 0:
+                bullish.extend(mr)
+
+            elif ms < 0:
+                bearish.extend(mr)
+
+        # --------------------------------
+        # Conflict penalty
+        # --------------------------------
+
+        if bullish and bearish:
+            total *= 0.92
+
+        if total >= 1:
+            side = "BUY"
+
+        elif total <= -1:
+            side = "SELL"
+
+        else:
+            side = "WAIT"
+
+        confidence = confidence_from_score(
+            total,
+            sources,
+            event_risk,
+        )
+
+        oi_pcr = oi.get("pcr")
+
+        headlines = [
+            n["title"]
+            for n in all_news.get(stock, [])[:2]
+        ]
+
+        output.append({
+            "Stock": stock,
+            "Side": side,
+            "Score": round(total, 2),
+            "Confidence": confidence,
+            "Stock PCR": (
+                round(oi_pcr, 2)
+                if oi_pcr is not None
+                else None
+            ),
+            "Bull": bullish[:5],
+            "Bear": bearish[:5],
+            "News": headlines,
+            "Chart": tv_stock(stock),
+        })
+
+    output.sort(
+        key=lambda x: abs(x["Score"]),
+        reverse=True,
+    )
+
+    return output
+
+
+# ================================================================
+# 15. STOCK OI PARALLEL
+# ================================================================
+
+def fetch_stock_oi_parallel(stocks):
+    result = {}
+
+    # NSE endpoints often throttle aggressive concurrency.
+    # Keep workers conservative.
+    workers = min(5, max(1, len(stocks)))
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers
+    ) as pool:
+
+        futures = {
+            pool.submit(
+                stock_option_chain,
+                stock,
+            ): stock
+            for stock in stocks
+        }
+
+        for fut in concurrent.futures.as_completed(
+            futures
+        ):
+
+            stock = futures[fut]
+
+            try:
+                result[stock] = fut.result()
+
+            except Exception:
+                result[stock] = {}
+
+    return result
+
+
+# ================================================================
+# 16. FULL INTELLIGENCE SNAPSHOT
+# ================================================================
+
+def create_intelligence_snapshot(
+    stocks,
+    timeframes,
+):
+
+    # Independent workloads run together.
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=5
+    ) as pool:
+
+        f_tf = pool.submit(
+            fetch_timeframes_parallel,
+            stocks,
+            timeframes,
+        )
+
+        f_news = pool.submit(
+            fetch_all_news,
+            stocks,
+        )
+
+        f_oi = pool.submit(
+            fetch_stock_oi_parallel,
+            stocks,
+        )
+
+        f_macro = pool.submit(
+            global_macro,
+        )
+
+        f_events = pool.submit(
+            india_events_today,
+        )
+
+        tf_data = f_tf.result()
+        all_news = f_news.result()
+        stock_oi = f_oi.result()
+        macro = f_macro.result()
+        events = f_events.result()
+
+    nifty_oi = nifty_option_chain()
+    fii = get_fii_dii()
+
+    hypotheses = build_hypothesis(
+        stocks,
+        tf_data,
+        all_news,
+        stock_oi,
+        nifty_oi,
+        macro,
+        fii,
+        events,
+    )
+
+    return {
+        "tf_data": tf_data,
+        "news": all_news,
+        "stock_oi": stock_oi,
+        "macro": macro,
+        "events": events,
+        "nifty_oi": nifty_oi,
+        "fii": fii,
+        "hypotheses": hypotheses,
+        "timestamp": now_ist(),
+    }
+
+
+# ================================================================
+# 17. SIDEBAR + AUTO REFRESH
+# ================================================================
+
+st.sidebar.header("⚙️ Engine")
+
+refresh_seconds = st.sidebar.slider(
+    "Auto Refresh (seconds)",
+    min_value=30,
+    max_value=600,
+    value=120,
+    step=30,
 )
 
-st.session_state.last_refresh = datetime.now(IST)
+if HAS_AUTOREFRESH:
+    st_autorefresh(
+        interval=refresh_seconds * 1000,
+        key="market_auto_refresh",
+    )
+else:
+    st.sidebar.warning(
+        "streamlit-autorefresh install नहीं है।"
+    )
+
+selected = st.sidebar.multiselect(
+    "Stocks",
+    WATCHLIST,
+    default=WATCHLIST[:20],
+)
+
+selected_tfs = st.sidebar.multiselect(
+    "Timeframes",
+    list(TIMEFRAMES),
+    default=[
+        "15 Min",
+        "1 Hour",
+        "Daily",
+    ],
+)
+
+force = st.sidebar.button(
+    "🔄 Force refresh"
+)
+
+if force:
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.caption(
+    f"IST: {now_ist():%d-%b-%Y %H:%M:%S}"
+)
+
+
+# ================================================================
+# 18. DASHBOARD
+# ================================================================
+
+st.title(
+    "📈 Institutional Market Intelligence Dashboard"
+)
+
+st.caption(
+    "Live/near-live technical structure + D&S + "
+    "News + F&O OI/PCR + FII/DII + Global Macro "
+    "+ India Economic Events"
+)
+
+if not selected:
+    st.warning(
+        "कम से कम एक stock select करें।"
+    )
+    st.stop()
+
+if not selected_tfs:
+    st.warning(
+        "कम से कम एक timeframe select करें।"
+    )
+    st.stop()
+
+
+# Automatically runs every Streamlit rerun.
+with st.spinner(
+    "Current market intelligence update हो रहा है..."
+):
+    try:
+        snapshot = create_intelligence_snapshot(
+            selected,
+            selected_tfs,
+        )
+
+    except Exception as exc:
+        st.error(
+            f"Dashboard update failed: {exc}"
+        )
+        st.stop()
+
+
+# ================================================================
+# 19. MARKET CONTEXT
+# ================================================================
+
+macro = snapshot["macro"]
+nifty = snapshot["nifty_oi"]
+fii = snapshot["fii"]
+events = snapshot["events"]
+
+risk, high_events, med_events = (
+    india_event_risk(events)
+)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric(
+    "Nifty PCR",
+    (
+        f"{nifty['pcr']:.2f}"
+        if nifty.get("pcr") is not None
+        else "N/A"
+    )
+)
+
+c2.metric(
+    "Max Put OI",
+    nifty.get(
+        "support",
+        "N/A",
+    )
+)
+
+c3.metric(
+    "Max Call OI",
+    nifty.get(
+        "resistance",
+        "N/A",
+    )
+)
+
+c4.metric(
+    "FII Net",
+    (
+        f"₹{fii['fii']:.0f} Cr"
+        if fii["available"]
+        else "N/A"
+    )
+)
+
+c5.metric(
+    "India Event Risk",
+    risk,
+)
+
+
+# ================================================================
+# 20. TABS
+# ================================================================
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🎯 Buy/Sell Hypothesis",
+    "📰 Current News",
+    "📊 Stock OI / PCR",
+    "🌍 Macro",
+    "🇮🇳 India Events",
+])
+
+
+# ================================================================
+# 21. HYPOTHESIS TAB
+# ================================================================
+
+with tab1:
+
+    st.subheader(
+        "Current Multi-Factor Buy / Sell Hypothesis"
+    )
+
+    st.caption(
+        "Confidence एक heuristic confidence score है, "
+        "statistical probability नहीं। WAIT का अर्थ है कि "
+        "current evidence पर्याप्त directional edge नहीं देता।"
+    )
+
+    hypotheses = snapshot["hypotheses"]
+
+    buys = [
+        x for x in hypotheses
+        if x["Side"] == "BUY"
+    ]
+
+    sells = [
+        x for x in hypotheses
+        if x["Side"] == "SELL"
+    ]
+
+    waits = [
+        x for x in hypotheses
+        if x["Side"] == "WAIT"
+    ]
+
+    col_buy, col_sell = st.columns(2)
+
+    with col_buy:
+
+        st.markdown("### 🟢 BUY Candidates")
+
+        if not buys:
+            st.info(
+                "Current data में strong BUY candidate नहीं।"
+            )
+
+        for x in buys[:10]:
+
+            with st.container(border=True):
+
+                st.markdown(
+                    f"#### {x['Stock']} — "
+                    f"{x['Confidence']}%"
+                )
+
+                st.write(
+                    f"Score: {x['Score']} | "
+                    f"Stock PCR: "
+                    f"{x['Stock PCR'] or 'N/A'}"
+                )
+
+                if x["Bull"]:
+                    st.success(
+                        " • ".join(x["Bull"])
+                    )
+
+                if x["Bear"]:
+                    st.warning(
+                        "Counter evidence: "
+                        + " • ".join(
+                            x["Bear"][:2]
+                        )
+                    )
+
+                if x["News"]:
+                    st.caption(
+                        "News: "
+                        + " | ".join(x["News"])
+                    )
+
+                st.link_button(
+                    "📈 Chart",
+                    x["Chart"],
+                )
+
+    with col_sell:
+
+        st.markdown("### 🔴 SELL Candidates")
+
+        if not sells:
+            st.info(
+                "Current data में strong SELL candidate नहीं।"
+            )
+
+        for x in sells[:10]:
+
+            with st.container(border=True):
+
+                st.markdown(
+                    f"#### {x['Stock']} — "
+                    f"{x['Confidence']}%"
+                )
+
+                st.write(
+                    f"Score: {x['Score']} | "
+                    f"Stock PCR: "
+                    f"{x['Stock PCR'] or 'N/A'}"
+                )
+
+                if x["Bear"]:
+                    st.error(
+                        " • ".join(x["Bear"])
+                    )
+
+                if x["Bull"]:
+                    st.warning(
+                        "Counter evidence: "
+                        + " • ".join(
+                            x["Bull"][:2]
+                        )
+                    )
+
+                if x["News"]:
+                    st.caption(
+                        "News: "
+                        + " | ".join(x["News"])
+                    )
+
+                st.link_button(
+                    "📈 Chart",
+                    x["Chart"],
+                )
+
+    st.markdown("---")
+    st.markdown("### 🟡 WAIT / Mixed")
+
+    if waits:
+
+        wait_df = pd.DataFrame([
+            {
+                "Stock": x["Stock"],
+                "Score": x["Score"],
+                "Confidence": x["Confidence"],
+                "Stock PCR": x["Stock PCR"],
+            }
+            for x in waits
+        ])
+
+        st.dataframe(
+            wait_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ================================================================
+# 22. NEWS
+# ================================================================
+
+with tab2:
+
+    st.subheader(
+        "Current Stock News / Events"
+    )
+
+    for stock in selected:
+
+        news = snapshot["news"].get(
+            stock,
+            [],
+        )
+
+        with st.expander(
+            f"{stock} ({len(news)} headlines)"
+        ):
+
+            if not news:
+                st.caption(
+                    "Recent headline उपलब्ध नहीं।"
+                )
+
+            for n in news:
+
+                sentiment = n["sentiment"]
+
+                tag = (
+                    "🟢"
+                    if sentiment > 0
+                    else "🔴"
+                    if sentiment < 0
+                    else "⚪"
+                )
+
+                st.markdown(
+                    f"{tag} [{n['title']}]"
+                    f"({n['url']})"
+                )
+
+
+# ================================================================
+# 23. STOCK OPTION OI
+# ================================================================
+
+with tab3:
+
+    st.subheader(
+        "Stock F&O Open Interest / PCR"
+    )
+
+    rows = []
+
+    for stock in selected:
+
+        o = snapshot["stock_oi"].get(
+            stock,
+            {},
+        )
+
+        if not o:
+            continue
+
+        rows.append({
+            "Stock": stock,
+            "PCR": (
+                round(o["pcr"], 2)
+                if o.get("pcr") is not None
+                else None
+            ),
+            "Put OI": o.get("put_oi"),
+            "Call OI": o.get("call_oi"),
+            "Put ΔOI": o.get("put_change_oi"),
+            "Call ΔOI": o.get("call_change_oi"),
+            "Support": o.get("support"),
+            "Resistance": o.get("resistance"),
+        })
+
+    if rows:
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info(
+            "Selected stocks के लिए NSE option-chain "
+            "data उपलब्ध नहीं है। ध्यान दें: केवल F&O "
+            "eligible stocks का stock PCR मिल सकता है।"
+        )
+
+
+# ================================================================
+# 24. GLOBAL MACRO
+# ================================================================
+
+with tab4:
+
+    st.subheader(
+        "Global Macro Impact"
+    )
+
+    macro_rows = []
+
+    for name, x in macro.items():
+
+        macro_rows.append({
+            "Asset": name,
+            "Price": round(
+                x["price"],
+                3,
+            ),
+            "% Change": round(
+                x["pct"],
+                2,
+            ),
+        })
+
+    if macro_rows:
+
+        mdf = pd.DataFrame(
+            macro_rows
+        )
+
+        st.dataframe(
+            mdf,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown(
+        """
+Macro engine stock sensitivity भी लागू करता है:
+IT में NASDAQ/USDINR, upstream/OMC में crude,
+metals में copper तथा broad market में S&P 500,
+DXY और US yields का प्रभाव लिया जाता है।
+        """
+    )
+
+
+# ================================================================
+# 25. INDIA ECONOMIC EVENTS
+# ================================================================
+
+with tab5:
+
+    st.subheader(
+        "India Economic Event Risk"
+    )
+
+    if not events:
+
+        st.info(
+            "आज India economic-calendar event "
+            "feed में कोई event उपलब्ध नहीं है।"
+        )
+
+    else:
+
+        st.dataframe(
+            pd.DataFrame(events),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if risk == "HIGH":
+        st.warning(
+            "High-impact India event मौजूद है। "
+            "Hypothesis confidence automatically reduced है। "
+            "Actual-vs-forecast data आने से पहले engine event "
+            "को bullish/bearish assume नहीं करता।"
+        )
+
+
+# ================================================================
+# 26. FOOTER / DATA QUALITY
+# ================================================================
+
+st.markdown("---")
+
+st.caption(
+    f"Last intelligence build: "
+    f"{snapshot['timestamp']:%d-%b-%Y %H:%M:%S IST}. "
+    "Yahoo Finance और public/news feeds exchange-grade tick feeds "
+    "नहीं हैं; timestamps/delays source के अनुसार अलग हो सकते हैं. "
+    "NSE endpoints unavailable/rate-limited होने पर संबंधित factor "
+    "neutral/NA रहता है, fabricated value इस्तेमाल नहीं होती।"
+)
