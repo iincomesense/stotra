@@ -725,3 +725,944 @@ def check_ds_zones(df: pd.DataFrame, symbol: str, tf_key: str,
     if signals:
         return " | ".join(signals), is_hq_signal, best_zone_detail
     return None, False, None
+
+# ==========================================
+# 4. AI EVIDENCE-BASED BUY/SELL HYPOTHESIS ENGINE
+# ==========================================
+Direction = str  # "bullish" | "bearish" | "neutral"
+
+@dataclass
+class EvidenceItem:
+    source: str
+    detail: str
+    direction: Direction
+    weight: float
+    confidence: float = 1.0
+    timestamp: str = ""
+
+    @property
+    def signed_score(self) -> float:
+        sign = 1.0 if self.direction == "bullish" else (-1.0 if self.direction == "bearish" else 0.0)
+        return sign * self.weight * self.confidence
+
+
+@dataclass
+class Hypothesis:
+    stock: str
+    price: Optional[float]
+    label: str
+    score: float
+    confidence_label: str
+    bullish_count: int
+    bearish_count: int
+    evidence: List[EvidenceItem] = field(default_factory=list)
+    suggested_entry: Optional[float] = None
+    suggested_sl: Optional[float] = None
+    suggested_tp: Optional[float] = None
+    zone_source_tf: Optional[str] = None
+    generated_at: str = field(default_factory=lambda: datetime.now(IST).strftime("%H:%M:%S"))
+
+
+W_DS_HQ_ZONE, W_DS_NORMAL_ZONE, W_DS_MTF_BONUS = 2.2, 1.3, 0.6
+W_EMA_20_50, W_EMA_3_5, W_RSI_EXTREME, W_VOL_SPIKE, W_MTF_ALIGN_BONUS = 1.0, 0.4, 0.5, 0.6, 1.0
+W_NEWS_KEYWORD, W_CORP_ANNOUNCE, NEWS_STALE_HOURS = 0.8, 0.6, 24
+W_MACRO_STOCK_SPEC, W_MACRO_BROAD, W_SECTOR_MOVE, W_FII_DII, W_OPTIONS_PCR = 0.7, 0.3, 0.5, 0.3, 0.4
+MIN_EVIDENCE_FOR_STRONG, MIN_EVIDENCE_FOR_ANY_CALL = 4, 2
+SCORE_STRONG, SCORE_MODERATE = 3.0, 1.3
+
+STOCK_SECTOR_MAP: Dict[str, str] = {
+    "TCS": "Nifty IT", "HCLTECH": "Nifty IT", "INFY": "Nifty IT", "WIPRO": "Nifty IT",
+    "TECHM": "Nifty IT", "PERSISTENT": "Nifty IT", "COFORGE": "Nifty IT",
+    "M&M": "Nifty Auto", "BAJAJ_AUTO": "Nifty Auto", "MARUTI": "Nifty Auto",
+    "TATAMOTORS": "Nifty Auto", "EICHERMOT": "Nifty Auto", "TVSMOTOR": "Nifty Auto",
+    "HEROMOTOCO": "Nifty Auto", "MOTHERSON": "Nifty Auto", "TIINDIA": "Nifty Auto",
+    "ASHOKLEY": "Nifty Auto", "BHARATFORG": "Nifty Auto", "TMPV": "Nifty Auto", "TMCV": "Nifty Auto",
+    "HDFCBANK": "Nifty Bank", "ICICIBANK": "Nifty Bank", "KOTAKBANK": "Nifty Bank",
+    "AXISBANK": "Nifty Bank", "INDUSINDBK": "Nifty Bank", "FEDERALBNK": "Nifty Bank",
+    "IDFCFIRSTB": "Nifty Bank", "AUBANK": "Nifty Bank",
+    "SBIN": "Nifty PSU Bank", "PNB": "Nifty PSU Bank", "CANBK": "Nifty PSU Bank", "BANKBARODA": "Nifty PSU Bank",
+    "HINDUNILVR": "Nifty FMCG", "NESTLEIND": "Nifty FMCG", "ITC": "Nifty FMCG",
+    "BRITANNIA": "Nifty FMCG", "DABUR": "Nifty FMCG", "MARICO": "Nifty FMCG",
+    "GODREJCP": "Nifty FMCG", "TATACONSUM": "Nifty FMCG", "VBL": "Nifty FMCG", "UNITDSPR": "Nifty FMCG",
+    "SUNPHARMA": "Nifty Pharma", "AUROPHARMA": "Nifty Pharma", "LUPIN": "Nifty Pharma",
+    "CIPLA": "Nifty Pharma", "DRREDDY": "Nifty Pharma", "DIVISLAB": "Nifty Pharma",
+    "TORNTPHARM": "Nifty Pharma", "LAURUSLABS": "Nifty Pharma",
+    "TATASTEEL": "Nifty Metal", "JSWSTEEL": "Nifty Metal", "HINDALCO": "Nifty Metal",
+    "VEDL": "Nifty Metal", "NATIONALUM": "Nifty Metal", "JINDALSTEL": "Nifty Metal",
+    "COALINDIA": "Nifty Metal", "NMDC": "Nifty Metal",
+    "RELIANCE": "Nifty Energy", "ONGC": "Nifty Energy", "BPCL": "Nifty Energy",
+    "IOC": "Nifty Energy", "HINDPETRO": "Nifty Energy", "OIL": "Nifty Energy",
+    "GAIL": "Nifty Energy", "NTPC": "Nifty Energy", "POWERGRID": "Nifty Energy",
+    "TATAPOWER": "Nifty Energy", "JSWENERGY": "Nifty Energy", "ADANIENT": "Nifty Energy",
+    "OBEROIRLTY": "Nifty Realty", "LODHA": "Nifty Realty", "PHOENIXLTD": "Nifty Realty", "GMRAIRPORT": "Nifty Realty",
+    "BAJFINANCE": "Nifty Financial Services", "SHRIRAMFIN": "Nifty Financial Services",
+    "MUTHOOTFIN": "Nifty Financial Services", "SBILIFE": "Nifty Financial Services",
+    "HDFCLIFE": "Nifty Financial Services", "SBICARD": "Nifty Financial Services",
+    "MFSL": "Nifty Financial Services", "CHOLAFIN": "Nifty Financial Services",
+    "ICICIGI": "Nifty Financial Services", "HDFCAMC": "Nifty Financial Services",
+    "PFC": "Nifty Financial Services", "RECLTD": "Nifty Financial Services",
+    "JIOFIN": "Nifty Financial Services", "POLICYBZR": "Nifty Financial Services",
+}
+
+IT_STOCKS = {"TCS", "HCLTECH", "INFY", "WIPRO", "TECHM", "PERSISTENT", "COFORGE"}
+OMC_STOCKS = {"BPCL", "IOC", "HINDPETRO"}
+UPSTREAM_OIL_STOCKS = {"ONGC", "OIL"}
+AVIATION_PAINT_STOCKS = {"INDIGO", "ASIANPAINT"}
+BANK_NBFC_STOCKS = {"HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "BAJFINANCE",
+                     "INDUSINDBK", "FEDERALBNK", "PNB", "CANBK", "BANKBARODA", "IDFCFIRSTB", "AUBANK"}
+METAL_STOCKS = {"HINDALCO", "VEDL", "NATIONALUM", "TATASTEEL", "JSWSTEEL", "JINDALSTEL"}
+NIFTY_HEAVYWEIGHTS = {"HDFCBANK", "RELIANCE", "ICICIBANK", "INFY", "ITC", "TCS",
+                       "LT", "AXISBANK", "SBIN", "BHARTIARTL", "KOTAKBANK"}
+
+POSITIVE_KEYWORDS = [
+    "record profit", "profit jumps", "profit surges", "profit rises", "net profit up",
+    "order win", "wins order", "bags order", "bags contract", "big order",
+    "upgrade", "outperform", "buy rating", "rating upgrade", "target price raised",
+    "buyback", "special dividend", "interim dividend", "bonus issue", "stock split",
+    "capacity expansion", "new plant", "new facility", "commissions plant",
+    "strong guidance", "beats estimates", "beats street estimates", "robust growth",
+    "market share gain", "stake acquisition", "acquires", "acquisition completed",
+    "partnership", "strategic tie-up", "collaboration", "joint venture",
+    "product launch", "regulatory approval", "usfda approval", "patent granted",
+    "block deal buy", "bulk deal buy", "insider buying", "promoter increases stake",
+    "qip fully subscribed", "strong q1", "strong q2", "strong q3", "strong q4",
+    "raises guidance", "record revenue", "highest ever",
+]
+NEGATIVE_KEYWORDS = [
+    "profit falls", "profit declines", "profit drops", "net loss", "loss widens",
+    "downgrade", "rating cut", "sell rating", "target price cut",
+    "sebi probe", "sebi action", "sebi bars", "fraud", "scam", "accounting irregularities",
+    "resignation", "ceo quits", "cfo resigns", "auditor resigns", "independent director quits",
+    "raid", "cbi raid", "ed raid", "income tax raid", "penalty imposed", "fine imposed",
+    "strike", "labour unrest", "plant shutdown", "production halted", "recall",
+    "debt default", "default on payment", "credit rating downgrade", "rating downgraded",
+    "block deal sell", "bulk deal sell", "insider selling", "promoter pledge",
+    "promoter stake sale", "stake sale by promoter", "weak guidance", "misses estimates",
+    "margin pressure", "cost pressure", "regulatory action", "show cause notice",
+    "goes into loss", "warns of", "profit warning",
+]
+
+def score_text_sentiment(text: str) -> Dict[str, Any]:
+    t = text.lower()
+    pos_hits = [kw for kw in POSITIVE_KEYWORDS if kw in t]
+    neg_hits = [kw for kw in NEGATIVE_KEYWORDS if kw in t]
+    if pos_hits and not neg_hits:
+        return {"direction": "bullish", "matched": pos_hits}
+    if neg_hits and not pos_hits:
+        return {"direction": "bearish", "matched": neg_hits}
+    if pos_hits and neg_hits:
+        return {"direction": "neutral", "matched": pos_hits + neg_hits}
+    return {"direction": "neutral", "matched": []}
+
+def _freshness_confidence(published_dt: Optional[datetime]) -> float:
+    if published_dt is None:
+        return 0.5
+    age_hours = (datetime.now(timezone.utc) - published_dt).total_seconds() / 3600.0
+    if age_hours <= 2: return 1.0
+    if age_hours <= 6: return 0.85
+    if age_hours <= NEWS_STALE_HOURS: return 0.6
+    return 0.3
+
+def collect_technical_evidence(stock: str, tf_signals: Dict[str, Dict[str, Any]]) -> List[EvidenceItem]:
+    evid: List[EvidenceItem] = []
+    votes = {"bullish": 0, "bearish": 0}
+    for tf_key, sig in tf_signals.items():
+        if not sig: continue
+        ds_sig = sig.get("ds_signal")
+        if ds_sig:
+            is_demand = "DEMAND" in ds_sig
+            is_hq = sig.get("is_hq_zone", False)
+            mtf_ok = sig.get("mtf_confirmed", False)
+            w = W_DS_HQ_ZONE if is_hq else W_DS_NORMAL_ZONE
+            direction = "bullish" if is_demand else "bearish"
+            evid.append(EvidenceItem("Technical - D&S Zone", f"[{tf_key}] {ds_sig}",
+                                      direction, w, min(1.0 + (0.15 if mtf_ok else 0.0), 1.3),
+                                      sig.get("bar_time", "")))
+            votes[direction] += 1
+            if mtf_ok:
+                evid.append(EvidenceItem("Technical - MTF Validation",
+                                          f"[{tf_key}] निचले टाइमफ्रेम पर zone confirm हुआ",
+                                          direction, W_DS_MTF_BONUS, 1.0, sig.get("bar_time", "")))
+        ema_sig = sig.get("ema_cross")
+        if ema_sig:
+            direction = "bullish" if "UP" in ema_sig else "bearish"
+            evid.append(EvidenceItem("Technical - EMA 20/50", f"[{tf_key}] {ema_sig}",
+                                      direction, W_EMA_20_50, 1.0, sig.get("bar_time", "")))
+            votes[direction] += 1
+        ema35_sig = sig.get("ema_cross_35")
+        if ema35_sig:
+            direction = "bullish" if "UP" in ema35_sig else "bearish"
+            evid.append(EvidenceItem("Technical - EMA 3/5 (Scalp)",
+                                      f"[{tf_key}] {ema35_sig} — सिर्फ momentum trigger",
+                                      direction, W_EMA_3_5, 0.8, sig.get("bar_time", "")))
+        rsi_sig = sig.get("rsi_signal")
+        if rsi_sig:
+            direction = "bearish" if "OB" in rsi_sig else "bullish"
+            evid.append(EvidenceItem("Technical - RSI(14)", f"[{tf_key}] {rsi_sig}",
+                                      direction, W_RSI_EXTREME, 0.7, sig.get("bar_time", "")))
+        vol_sig = sig.get("vol_spike")
+        if vol_sig and sig.get("candle_bullish") is not None:
+            direction = "bullish" if sig["candle_bullish"] else "bearish"
+            evid.append(EvidenceItem("Technical - Volume Spike",
+                                      f"[{tf_key}] {vol_sig} + {'bullish' if sig['candle_bullish'] else 'bearish'} candle",
+                                      direction, W_VOL_SPIKE, 0.9, sig.get("bar_time", "")))
+    if votes["bullish"] >= 2 and votes["bearish"] == 0:
+        evid.append(EvidenceItem("Technical - MTF Confluence",
+                                  f"{votes['bullish']} अलग टाइमफ्रेम पर बुलिश सिग्नल्स सहमत", "bullish", W_MTF_ALIGN_BONUS, 1.0))
+    elif votes["bearish"] >= 2 and votes["bullish"] == 0:
+        evid.append(EvidenceItem("Technical - MTF Confluence",
+                                  f"{votes['bearish']} अलग टाइमफ्रेम पर बेयरिश सिग्नल्स सहमत", "bearish", W_MTF_ALIGN_BONUS, 1.0))
+    return evid
+
+def collect_news_evidence(stock: str, news_items: List[Dict[str, Any]],
+                           corp_announcements: List[Dict[str, Any]]) -> List[EvidenceItem]:
+    evid: List[EvidenceItem] = []
+    for item in news_items[:8]:
+        title = item.get("title", "")
+        if not title: continue
+        result = score_text_sentiment(title)
+        if result["direction"] == "neutral": continue
+        conf = _freshness_confidence(item.get("published"))
+        evid.append(EvidenceItem("News", f"'{title[:90]}' → matched: {', '.join(result['matched'][:3])}",
+                                  result["direction"], W_NEWS_KEYWORD, conf, item.get("published_str", "")))
+    for ann in corp_announcements:
+        if str(ann.get("symbol", "")).strip().upper() != stock.upper(): continue
+        subj = ann.get("subject", "")
+        if not subj: continue
+        result = score_text_sentiment(subj)
+        if result["direction"] == "neutral": continue
+        evid.append(EvidenceItem("Corporate Announcement (NSE)",
+                                  f"'{subj[:90]}' → matched: {', '.join(result['matched'][:3])}",
+                                  result["direction"], W_CORP_ANNOUNCE, 0.9, str(ann.get("time", ""))))
+    return evid
+
+def collect_macro_evidence(stock: str, macro_quotes: Dict[str, Dict[str, Any]]) -> List[EvidenceItem]:
+    evid: List[EvidenceItem] = []
+    def pct_of(yft):
+        q = macro_quotes.get(yft)
+        return q["pct"] if q else None
+    usdinr_pct, crude_pct = pct_of("INR=X"), pct_of("CL=F")
+    us10y_pct, sp500_pct, copper_pct = pct_of("^TNX"), pct_of("^GSPC"), pct_of("HG=F")
+
+    if stock in IT_STOCKS and usdinr_pct is not None and abs(usdinr_pct) >= 0.15:
+        direction = "bullish" if usdinr_pct > 0 else "bearish"
+        evid.append(EvidenceItem("Macro - USD/INR", f"USD/INR {usdinr_pct:+.2f}% — IT export revenue पर असर",
+                                  direction, W_MACRO_STOCK_SPEC, 1.0))
+    if stock in OMC_STOCKS and crude_pct is not None and abs(crude_pct) >= 0.5:
+        direction = "bearish" if crude_pct > 0 else "bullish"
+        evid.append(EvidenceItem("Macro - Crude Oil", f"WTI Crude {crude_pct:+.2f}% — OMC इनपुट कॉस्ट पर असर",
+                                  direction, W_MACRO_STOCK_SPEC, 1.0))
+    if stock in UPSTREAM_OIL_STOCKS and crude_pct is not None and abs(crude_pct) >= 0.5:
+        direction = "bullish" if crude_pct > 0 else "bearish"
+        evid.append(EvidenceItem("Macro - Crude Oil", f"WTI Crude {crude_pct:+.2f}% — upstream realisation पर असर",
+                                  direction, W_MACRO_STOCK_SPEC, 1.0))
+    if stock in AVIATION_PAINT_STOCKS and crude_pct is not None and abs(crude_pct) >= 0.5:
+        direction = "bearish" if crude_pct > 0 else "bullish"
+        evid.append(EvidenceItem("Macro - Crude Oil", f"WTI Crude {crude_pct:+.2f}% — ATF/इनपुट कॉस्ट पर असर",
+                                  direction, W_MACRO_STOCK_SPEC, 1.0))
+    if stock in BANK_NBFC_STOCKS and us10y_pct is not None and abs(us10y_pct) >= 1.0:
+        direction = "bearish" if us10y_pct > 0 else "bullish"
+        evid.append(EvidenceItem("Macro - US 10Y Yield", f"US 10Y yield {us10y_pct:+.2f}% — FII flow पर असर",
+                                  direction, W_MACRO_STOCK_SPEC, 0.8))
+    if stock in METAL_STOCKS and copper_pct is not None and abs(copper_pct) >= 0.5:
+        direction = "bullish" if copper_pct > 0 else "bearish"
+        evid.append(EvidenceItem("Macro - Copper", f"Copper {copper_pct:+.2f}% — base-metal sentiment",
+                                  direction, W_MACRO_STOCK_SPEC, 0.85))
+    if sp500_pct is not None and abs(sp500_pct) >= 0.4:
+        direction = "bullish" if sp500_pct > 0 else "bearish"
+        evid.append(EvidenceItem("Macro - Global (S&P500)", f"US S&P500 {sp500_pct:+.2f}% — broad global sentiment",
+                                  direction, W_MACRO_BROAD, 0.7))
+    return evid
+
+def collect_sector_evidence(stock: str, sector_quotes: Dict[str, Optional[float]]) -> List[EvidenceItem]:
+    sector_name = STOCK_SECTOR_MAP.get(stock)
+    if not sector_name: return []
+    pct = sector_quotes.get(sector_name)
+    if pct is None or abs(pct) < 0.3: return []
+    direction = "bullish" if pct > 0 else "bearish"
+    return [EvidenceItem("Sector", f"{sector_name} इंडेक्स {pct:+.2f}% — सेक्टर-वाइड मोमेंटम", direction, W_SECTOR_MOVE, 0.85)]
+
+def collect_fii_dii_evidence(fii_net, dii_net) -> List[EvidenceItem]:
+    evid = []
+    if fii_net is not None and abs(fii_net) >= 300:
+        direction = "bullish" if fii_net > 0 else "bearish"
+        evid.append(EvidenceItem("FII/DII Flow", f"FII Net (कल EOD): ₹{fii_net:+.0f} Cr", direction, W_FII_DII, 0.7))
+    if dii_net is not None and abs(dii_net) >= 300:
+        direction = "bullish" if dii_net > 0 else "bearish"
+        evid.append(EvidenceItem("FII/DII Flow", f"DII Net (कल EOD): ₹{dii_net:+.0f} Cr", direction, W_FII_DII, 0.7))
+    return evid
+
+def collect_options_evidence(stock: str, pcr: Optional[float]) -> List[EvidenceItem]:
+    if stock not in NIFTY_HEAVYWEIGHTS or pcr is None: return []
+    if pcr > 1.15:
+        return [EvidenceItem("Options - Nifty PCR", f"Nifty PCR {pcr} (>1.15) — put-heavy bullish bias",
+                              "bullish", W_OPTIONS_PCR, 0.6)]
+    if pcr < 0.80:
+        return [EvidenceItem("Options - Nifty PCR", f"Nifty PCR {pcr} (<0.80) — call-heavy bearish bias",
+                              "bearish", W_OPTIONS_PCR, 0.6)]
+    return []
+
+def classify_score(score: float, evidence_count: int) -> str:
+    if evidence_count < MIN_EVIDENCE_FOR_ANY_CALL: return "NEUTRAL"
+    if score >= SCORE_STRONG and evidence_count >= MIN_EVIDENCE_FOR_STRONG: return "STRONG BUY"
+    if score >= SCORE_MODERATE: return "BUY"
+    if score <= -SCORE_STRONG and evidence_count >= MIN_EVIDENCE_FOR_STRONG: return "STRONG SELL"
+    if score <= -SCORE_MODERATE: return "SELL"
+    return "NEUTRAL"
+
+def confidence_label(bullish: int, bearish: int) -> str:
+    total = bullish + bearish
+    if total == 0: return "Low"
+    ratio = max(bullish, bearish) / total
+    if total >= 5 and ratio >= 0.75: return "High"
+    if total >= 3 and ratio >= 0.6: return "Medium"
+    return "Low"
+
+def build_hypothesis(stock, price, tf_signals, news_items=None, corp_announcements=None,
+                      macro_quotes=None, sector_quotes=None, fii_net=None, dii_net=None,
+                      nifty_pcr=None) -> Hypothesis:
+    all_evidence: List[EvidenceItem] = []
+    all_evidence += collect_technical_evidence(stock, tf_signals or {})
+    all_evidence += collect_news_evidence(stock, news_items or [], corp_announcements or [])
+    all_evidence += collect_macro_evidence(stock, macro_quotes or {})
+    all_evidence += collect_sector_evidence(stock, sector_quotes or {})
+    all_evidence += collect_fii_dii_evidence(fii_net, dii_net)
+    all_evidence += collect_options_evidence(stock, nifty_pcr)
+
+    total_score = sum(e.signed_score for e in all_evidence)
+    bullish_count = sum(1 for e in all_evidence if e.direction == "bullish")
+    bearish_count = sum(1 for e in all_evidence if e.direction == "bearish")
+    evidence_count = bullish_count + bearish_count
+
+    label = classify_score(total_score, evidence_count)
+    conf = confidence_label(bullish_count, bearish_count)
+
+    entry = sl = tp = zone_tf = None
+    for tf_key, sig in (tf_signals or {}).items():
+        if sig and sig.get("ds_signal") and sig.get("zone_entry") is not None:
+            if sig.get("is_hq_zone") or entry is None:
+                entry, sl, tp, zone_tf = sig.get("zone_entry"), sig.get("zone_sl"), sig.get("zone_tp"), tf_key
+                if sig.get("is_hq_zone"): break
+
+    all_evidence.sort(key=lambda e: abs(e.signed_score), reverse=True)
+    return Hypothesis(stock, price, label, round(total_score, 2), conf, bullish_count,
+                       bearish_count, all_evidence, entry, sl, tp, zone_tf)
+
+def fetch_stock_news_items_full(stock_name: str, max_items: int = 6) -> List[Dict[str, Any]]:
+    if feedparser is None: return []
+    query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    items = []
+    try:
+        resp = requests.get(url, timeout=8, headers=NSE_HEADERS)
+        feed = feedparser.parse(resp.content)
+        for e in feed.entries[:max_items]:
+            pub = e.get("published_parsed")
+            pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
+            items.append({
+                "title": e.get("title", ""), "link": e.get("link", ""), "published": pub_dt,
+                "published_str": pub_dt.astimezone(IST).strftime("%H:%M %d-%b") if pub_dt else "",
+            })
+    except Exception: pass
+    return items
+
+
+# ==========================================
+# 5. SIDEBAR SETTINGS
+# ==========================================
+st.sidebar.header("⚙️ Settings")
+is_mobile_view = st.sidebar.checkbox("📱 Mobile Compact View", value=False)
+refresh_min = st.sidebar.slider("Auto-Refresh हर (मिनट)", 0.5, 15.0, 2.0, 0.5)
+if HAS_AUTOREFRESH:
+    st_autorefresh(interval=int(refresh_min * 60 * 1000), key="auto_refresh")
+
+st.sidebar.markdown(f"🕒 IST: **{now_ist().strftime('%d-%b-%Y %H:%M:%S')}**")
+st.sidebar.markdown("🟢 भारतीय बाज़ार खुला" if is_market_hours() else "🔴 भारतीय बाज़ार बंद")
+if st.sidebar.button("🔄 अभी Refresh करें"):
+    st.cache_data.clear()
+    st.session_state.ds_zone_cache = {}  # जानबूझकर पूरा clear — user खुद चाहता है fresh scan
+    st.rerun()
+
+selected_stocks = st.sidebar.multiselect("Indian Stock Watchlist", WATCHLIST_DEFAULT, default=WATCHLIST_DEFAULT[:40])
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📊 Signal & Scan Settings")
+scan_scope = st.sidebar.multiselect("Scan Scope", ["Indian Watchlist", "Global Markets"],
+                                     default=["Indian Watchlist", "Global Markets"])
+tf_options = ["ALL"] + list(TIMEFRAMES.keys())
+selected_tf_raw = st.sidebar.multiselect("Signal Scan Timeframes", tf_options, default=["5 Min", "1 Hour", "Daily"])
+signal_timeframes = list(TIMEFRAMES.keys()) if "ALL" in selected_tf_raw else selected_tf_raw
+
+selected_indicators = st.sidebar.multiselect(
+    "इंडिकेटर चुनें",
+    ["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "EMA Crossover (3/5)", "Volume Spike", "RSI (14)"],
+    default=["Institutional D&S Zones (Demand/Supply)", "EMA Crossover (20/50)", "Volume Spike"]
+)
+vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
+
+st.sidebar.markdown("---")
+use_mtf_validation = st.sidebar.checkbox("🔬 Multi-Timeframe No-Break Validation (सख्त, धीमा)", value=False)
+
+if "alerts" not in st.session_state: st.session_state.alerts = []
+if "alerts_clear_date" not in st.session_state: st.session_state.alerts_clear_date = None
+if "all_tf_signals_map" not in st.session_state: st.session_state.all_tf_signals_map = {}
+
+def maybe_clear_alerts():
+    today = now_ist().date()
+    if now_ist().time() >= dtime(ALERT_CLEAR_HOUR_IST, 0):
+        if st.session_state.alerts_clear_date != today:
+            st.session_state.alerts = []
+            st.session_state.alerts_clear_date = today
+maybe_clear_alerts()
+
+
+# ==========================================
+# 6. DATA FETCH ENGINES
+# ==========================================
+@st.cache_data(ttl=180, show_spinner=False)
+def unified_yf_download_engine(tickers_tuple, period="10d", interval="1d") -> Dict[str, pd.DataFrame]:
+    tickers = list(tickers_tuple)
+    if not tickers: return {}
+    try:
+        data = yf.download(tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
+    except Exception: return {}
+    out = {}
+    for t in tickers:
+        try:
+            df = data[t].dropna() if len(tickers) > 1 else data.dropna()
+            if not df.empty: out[t] = df
+        except Exception: continue
+    return out
+
+def get_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    daily_data = unified_yf_download_engine(tuple(tickers), period="10d", interval="1d")
+    intraday_data = unified_yf_download_engine(tuple(tickers), period="1d", interval="5m")
+    quotes = {}
+    for t in tickers:
+        df_d = daily_data.get(t)
+        if df_d is None or len(df_d) < 2: continue
+        last, prev = df_d["Close"].iloc[-1], df_d["Close"].iloc[-2]
+        chg = last - prev
+        pct = (chg / prev) * 100
+        df_intra = intraday_data.get(t)
+        live_price = df_intra["Close"].iloc[-1] if df_intra is not None and len(df_intra) > 0 else last
+        quotes[t] = {"price": live_price, "pct": pct, "chg": chg}
+    return quotes
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_tf_data_single_v2(tf_key: str, items_tuple: Tuple):
+    cfg = TIMEFRAMES[tf_key]
+    yf_symbols = [item[1] for item in items_tuple]
+    if not yf_symbols: return {}
+    data = unified_yf_download_engine(tuple(yf_symbols), period=cfg["period"], interval=cfg["interval"])
+    out = {}
+    for display_name, yf_sym, tv_sym, cat in items_tuple:
+        df = data.get(yf_sym)
+        if df is None or df.empty: continue
+        if cfg["resample"]:
+            df = df.resample(cfg["resample"]).agg(
+                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+        if len(df) >= 20:
+            out[display_name] = {"df": df, "tv": tv_sym, "category": cat}
+    return out
+
+def fetch_all_tf_data_fast_v2(selected_tfs, items_tuple):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(selected_tfs), 8)) as executor:
+        future_to_tf = {executor.submit(fetch_tf_data_single_v2, tf, items_tuple): tf for tf in selected_tfs}
+        for future in concurrent.futures.as_completed(future_to_tf):
+            tf = future_to_tf[future]
+            try: results[tf] = future.result()
+            except Exception: results[tf] = {}
+    return results
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_nse_json(api_path):
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=8)
+        r = session.get(f"https://www.nseindia.com{api_path}", timeout=8)
+        if r.status_code == 200: return r.json()
+    except Exception: pass
+    return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_fii_dii():
+    try:
+        r = requests.get("https://sedg.in/p8nximtd", headers=NSE_HEADERS, timeout=10, allow_redirects=True)
+        for t in pd.read_html(io.StringIO(r.text)):
+            if t.shape[1] >= 3 and t.shape[0] >= 3: return t.head(5), "StockEdge"
+    except Exception: pass
+    fii_data = fetch_nse_json("/api/fiidiiTradeReact")
+    if fii_data: return pd.DataFrame(fii_data).head(5), "NSE (fallback)"
+    return None, None
+
+def fii_dii_insight(df):
+    try:
+        cols_lower = {c.lower(): c for c in df.columns}
+        net_col = cols_lower.get("netvalue") or cols_lower.get("net_value")
+        cat_col = cols_lower.get("category")
+        if not net_col or not cat_col: return None
+        fii_net, dii_net = None, None
+        for _, row in df.iterrows():
+            cat = str(row[cat_col]).upper()
+            try: val = float(row[net_col])
+            except Exception: continue
+            if "FII" in cat or "FPI" in cat: fii_net = val if fii_net is None else fii_net
+            elif "DII" in cat: dii_net = val if dii_net is None else dii_net
+        if fii_net is None and dii_net is None: return None
+        if fii_net > 0 and dii_net > 0: return "success", f"🟢 FII (₹{fii_net:+.0f} Cr) और DII (₹{dii_net:+.0f} Cr) दोनों खरीदार।"
+        if fii_net < 0 and dii_net > 0: return "info", f"🔵 FII बिकवाली पर DII सपोर्ट (₹{dii_net:+.0f} Cr)।"
+        if fii_net > 0 and dii_net < 0: return "info", f"🔵 FII खरीदारी, DII बेच रहे।"
+        if fii_net < 0 and dii_net < 0: return "error", f"🔴 दोनों बिकवाल — Cautious bias।"
+        return None
+    except Exception: return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_quick_news_link_live(stock_name: str):
+    if feedparser is None: return None
+    query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        feed = feedparser.parse(requests.get(url, timeout=8, headers=NSE_HEADERS).content)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        for e in feed.entries[:5]:
+            pub = e.get("published_parsed")
+            if pub and datetime(*pub[:6], tzinfo=timezone.utc) >= cutoff:
+                return e.link
+    except Exception: pass
+    return None
+
+def fetch_news_links_parallel(stocks):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(fetch_stock_quick_news_link_live, s): s for s in stocks}
+        for fut in concurrent.futures.as_completed(futures):
+            s = futures[fut]
+            try: results[s] = fut.result()
+            except Exception: results[s] = None
+    return results
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nse_corporate_announcements():
+    data = fetch_nse_json("/api/corporate-announcements?index=equities")
+    if not data: return []
+    items = []
+    for d in data[:50]:
+        try:
+            items.append({"symbol": d.get("symbol", ""), "subject": d.get("desc") or d.get("subject") or "",
+                          "time": d.get("an_dt") or d.get("sort_date") or ""})
+        except Exception: continue
+    return items
+
+
+# ==========================================
+# 7. STICKY SUMMARY BAR (हमेशा दिखे — freshness/status)
+# ==========================================
+st.markdown(f"""
+<div class="sticky-bar">
+    <span>🕒 {now_ist().strftime('%H:%M:%S')}</span>
+    <span>{'🟢 Market Open' if is_market_hours() else '🔴 Market Closed'}</span>
+    <span>Data: <b>Delayed ~15min (yfinance)</b></span>
+</div>
+""", unsafe_allow_html=True)
+st.title("📈 Full Market Dashboard & Institutional D&S Scanner")
+st.caption("⚠️ EDUCATIONAL टूल — SEBI-registered निवेश सलाह नहीं। Data delayed हो सकता है, अपनी पुष्टि खुद करें।")
+
+
+# ==========================================
+# 8. TABS
+# ==========================================
+tab_names = ["📊 Signals", "🤖 AI Hypothesis", "🔔 Alerts", "🌍 Global", "📋 Watchlist",
+             "🏭 Sector", "💰 FII/DII+Nifty", "🗓️ Calendar", "🏆 Movers"]
+
+if is_mobile_view:
+    section = st.selectbox("📱 सेक्शन चुनें", tab_names)
+else:
+    tabs = st.tabs(tab_names)
+
+
+def render_signal_card(row):
+    css_class = "demand" if ("DEMAND" in row["टाइप"] or "UP" in row["टाइप"]) else \
+                "supply" if ("SUPPLY" in row["टाइप"] or "DOWN" in row["टाइप"]) else ""
+    if "HQ" in row["सिग्नल"]: css_class = "hq"
+    st.markdown(f"""
+    <div class="signal-card {css_class}">
+        <div class="signal-title">{row['सिग्नल']} · {row['एसेट']} <span style="float:right">{row['LTP']}</span></div>
+        <div class="signal-sub">{row['टाइप']}</div>
+        <div class="signal-sub">⏱ {row['टाइमफ्रेम']} · {row['समय']} · <a href="{row['Chart']}" target="_blank">📈 Chart</a></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ---------- SIGNALS TAB CONTENT (function इसलिए ताकि mobile/desktop दोनों में reuse हो) ----------
+def render_signals_tab():
+    st.subheader("📊 Institutional D&S + Technical Scanner (Incremental Cache ⚡)")
+    is_after_close = now_ist().hour >= 16 or now_ist().hour < 8
+    if is_after_close:
+        st.info("🌙 भारतीय बाज़ार बंद — Daily स्कैन + Global Markets Live स्कैन चालू है।")
+
+    all_scan_items = []
+    if "Indian Watchlist" in scan_scope:
+        for s in selected_stocks:
+            all_scan_items.append((s, yf_ticker_for_stock(s), tv_symbol_for_stock(s), "🇮🇳 Stock"))
+    if "Global Markets" in scan_scope:
+        for sym, name, yft, tvs in GLOBAL_INSTRUMENTS:
+            if yft: all_scan_items.append((f"{sym} ({name})", yft, tvs, "🌍 Global"))
+
+    if not signal_timeframes or not all_scan_items:
+        st.warning("कृपया कम से कम एक Timeframe और Scope सलेक्ट करें।")
+        return
+
+    required_tfs = set(signal_timeframes)
+    if use_mtf_validation:
+        for tf_key in signal_timeframes:
+            lower_tf = LOWER_TF_MAP.get(tf_key)
+            if lower_tf: required_tfs.add(lower_tf)
+
+    with st.spinner("⚡ Fast Scanning चल रहा है..."):
+        all_tf_data = fetch_all_tf_data_fast_v2(tuple(required_tfs), tuple(all_scan_items))
+
+    rows = []
+    existing_keys = {a["key"] for a in st.session_state.alerts}
+    st.session_state.all_tf_signals_map = {}  # हर full-refresh पर rebuild (हल्का — सिर्फ dict, compute नहीं)
+
+    for tf_key in signal_timeframes:
+        tf_is_intraday = TIMEFRAMES[tf_key]["intraday"]
+        tf_data = all_tf_data.get(tf_key, {})
+        lower_tf_key = LOWER_TF_MAP.get(tf_key) if use_mtf_validation else None
+        lower_tf_data_for_this_tf = all_tf_data.get(lower_tf_key, {}) if lower_tf_key else {}
+
+        for item_name, item_dict in tf_data.items():
+            cat = item_dict["category"]
+            if is_after_close and tf_is_intraday and cat == "🇮🇳 Stock": continue
+
+            df = item_dict["df"]
+            tv_sym = item_dict["tv"]
+            price, bar_time = df["Close"].iloc[-1], df.index[-1]
+            close_np = df["Close"].to_numpy(dtype=np.float64)
+            vol_np = df["Volume"].to_numpy(dtype=np.float64)
+
+            type_parts, is_daily_vol_spike, is_hq_ds_zone = [], False, False
+            zone_detail = None
+
+            if "Institutional D&S Zones (Demand/Supply)" in selected_indicators:
+                lower_item = lower_tf_data_for_this_tf.get(item_name)
+                lower_df = lower_item["df"] if lower_item else None
+                # 🆕 यहीं incremental cached scanner call हो रहा है
+                ds_sig, is_hq, zone_detail = check_ds_zones(df, item_name, tf_key,
+                                                             lower_tf_df=lower_df, use_mtf=use_mtf_validation)
+                if ds_sig:
+                    type_parts.append(ds_sig)
+                    if is_hq: is_hq_ds_zone = True
+
+            cross = ema35_cross = rsi_sig = vr = None
+            if "EMA Crossover (20/50)" in selected_indicators:
+                cross = check_ema_cross_fast(close_np)
+                if cross: type_parts.append(cross)
+            if "EMA Crossover (3/5)" in selected_indicators:
+                ema35_cross = check_ema_cross_3_5(close_np)
+                if ema35_cross: type_parts.append(ema35_cross)
+            if "Volume Spike" in selected_indicators:
+                vr = check_volume_spike_fast(vol_np, vol_mult)
+                if vr:
+                    type_parts.append(vr)
+                    if tf_key == "Daily": is_daily_vol_spike = True
+            if "RSI (14)" in selected_indicators:
+                rsi_sig = check_rsi_fast(close_np)
+                if rsi_sig: type_parts.append(rsi_sig)
+
+            # 🆕 AI Hypothesis के लिए raw signal-dict भी collect करें (बिना नया fetch)
+            st.session_state.all_tf_signals_map.setdefault(item_name, {})[tf_key] = {
+                "ds_signal": type_parts[0] if (type_parts and "ZONE" in type_parts[0]) else None,
+                "is_hq_zone": is_hq_ds_zone, "mtf_confirmed": use_mtf_validation,
+                "ema_cross": cross, "ema_cross_35": ema35_cross, "rsi_signal": rsi_sig, "vol_spike": vr,
+                "candle_bullish": bool(df["Close"].iloc[-1] > df["Open"].iloc[-1]),
+                "price": float(price), "bar_time": bar_time.strftime("%H:%M %d-%b"),
+                "zone_entry": zone_detail["entry"] if zone_detail else None,
+                "zone_sl": zone_detail["sl"] if zone_detail else None,
+                "zone_tp": zone_detail["tp"] if zone_detail else None,
+            }
+
+            if not type_parts: continue
+            if is_hq_ds_zone: stars = "🚀 HQ Zone"
+            elif is_daily_vol_spike: stars = "🔥 Vol Spike"
+            elif len(type_parts) >= 2: stars = "⭐⭐ Strong"
+            else: stars = "⭐ Signal"
+
+            bar_time_str = bar_time.strftime("%H:%M %d-%b")
+            rows.append({"सिग्नल": stars, "कैटेगरी": cat, "एसेट": item_name, "टाइमफ्रेम": tf_key,
+                         "टाइप": " | ".join(type_parts), "LTP": round(price, 2), "समय": bar_time_str,
+                         "Chart": tv_link(tv_sym)})
+
+            alert_key = f"{item_name}|{tf_key}|{'|'.join(type_parts)}|{bar_time_str}"
+            if alert_key not in existing_keys:
+                st.session_state.alerts.append({
+                    "key": alert_key, "stock": item_name, "category": cat, "tf": tf_key,
+                    "type": " | ".join(type_parts), "stars": stars, "time": bar_time_str,
+                    "logged_at": now_ist().strftime("%H:%M:%S"), "chart": tv_link(tv_sym),
+                })
+                existing_keys.add(alert_key)
+
+    if not rows:
+        st.success("अभी कोई नया सिग्नल नहीं मिला।")
+    else:
+        sig_df = pd.DataFrame(rows)
+        sort_rank = {"🚀 HQ Zone": 4, "🔥 Vol Spike": 3, "⭐⭐ Strong": 2, "⭐ Signal": 1}
+        sig_df["_sort"] = sig_df["सिग्नल"].map(lambda x: sort_rank.get(x, 0))
+        sig_df = sig_df.sort_values(["_sort", "समय"], ascending=[False, False]).drop(columns="_sort")
+
+        if is_mobile_view:
+            for _, row in sig_df.iterrows(): render_signal_card(row)
+        else:
+            def hl(row):
+                if "HQ Zone" in row["सिग्नल"]: base = "background-color:#d1e7dd; font-weight:bold;"
+                elif row["सिग्नल"] == "🔥 Vol Spike": base = f"background-color:{COLOR_SPIKE_BG}"
+                elif row["सिग्नल"] == "⭐⭐ Strong": base = "background-color:#e8d4f8"
+                elif "DEMAND" in row["टाइप"] or "UP" in row["टाइप"]: base = f"background-color:{COLOR_POS_BG}"
+                elif "SUPPLY" in row["टाइप"] or "DOWN" in row["टाइप"]: base = f"background-color:{COLOR_NEG_BG}"
+                else: base = "background-color:#fff2cc"
+                return [base] * len(row)
+            st.dataframe(sig_df.style.apply(hl, axis=1), use_container_width=True, hide_index=True,
+                        column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")})
+
+
+LABEL_COLORS = {"STRONG BUY": ("#0a7d2f", "#d4f8d4"), "BUY": ("#0a7d2f", "#eafbea"),
+                "NEUTRAL": ("#70758A", "#f0f1f5"), "SELL": ("#c0392b", "#fdeeee"),
+                "STRONG SELL": ("#c0392b", "#f8d4d4")}
+
+def render_hypothesis_card(h: Hypothesis):
+    text_c, bg_c = LABEL_COLORS.get(h.label, ("#333", "#eee"))
+    st.markdown(f"""
+    <div style="background:{bg_c}; border-left:5px solid {text_c}; border-radius:10px; padding:14px 16px; margin-bottom:10px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:16px; font-weight:800; color:{text_c};">{h.label}</span>
+            <span style="font-size:13px; color:#555;">Score: {h.score} · भरोसा: {h.confidence_label}</span>
+        </div>
+        <div style="font-size:13px; margin-top:4px;">
+            <b>{h.stock}</b> · 👍 {h.bullish_count} बुलिश · 👎 {h.bearish_count} बेयरिश evidence
+        </div>
+    </div>""", unsafe_allow_html=True)
+    if h.suggested_entry:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entry (D&S Zone)", f"{h.suggested_entry:.2f}")
+        c2.metric("Stop Loss", f"{h.suggested_sl:.2f}")
+        c3.metric("Target", f"{h.suggested_tp:.2f}")
+        st.caption(f"स्रोत: {h.zone_source_tf} टाइमफ्रेम का Institutional D&S Zone")
+    if h.label == "NEUTRAL" and (h.bullish_count + h.bearish_count) < 2:
+        st.info("⚠️ पर्याप्त evidence नहीं — कोई पक्का निष्कर्ष नहीं।")
+    with st.expander(f"🔍 सभी Evidence देखें ({len(h.evidence)})"):
+        for e in h.evidence:
+            icon = "🟢" if e.direction == "bullish" else ("🔴" if e.direction == "bearish" else "⚪")
+            st.markdown(f"{icon} **[{e.source}]** {e.detail} "
+                        f"<span style='color:#888; font-size:11px;'>(weight: {e.signed_score:+.2f})</span>",
+                        unsafe_allow_html=True)
+    st.caption("⚠️ EDUCATIONAL टूल — SEBI-registered सलाह नहीं।")
+
+def render_ai_hypothesis_tab():
+    st.subheader("🤖 AI Buy/Sell Hypothesis — Evidence-Based")
+    st.caption("पहले Signals टैब खोलें ताकि तकनीकी evidence collect हो जाए, फिर यहां आएं।")
+    if not st.session_state.all_tf_signals_map:
+        st.warning("⚠️ पहले '📊 Signals' टैब खोलें ताकि Technical evidence भर जाए।")
+        return
+
+    macro_quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
+    sector_quotes_raw = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
+    sector_quotes = {name: sector_quotes_raw.get(yft, {}).get("pct") for name, yft in SECTOR_INDEX_TICKERS.items()}
+    fii_df, _ = fetch_fii_dii()
+    fii_net_val = dii_net_val = None
+    if fii_df is not None:
+        try:
+            net_col = [c for c in fii_df.columns if "net" in c.lower()][0]
+            cat_col = [c for c in fii_df.columns if "cat" in c.lower()][0]
+            for _, r in fii_df.iterrows():
+                if "FII" in str(r[cat_col]).upper(): fii_net_val = float(r[net_col])
+                elif "DII" in str(r[cat_col]).upper(): dii_net_val = float(r[net_col])
+        except Exception: pass
+
+    oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+    pcr_value = None
+    if oc_data:
+        try:
+            records = oc_data["records"]["data"]
+            tc = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
+            tp = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
+            pcr_value = round(tp / tc, 2) if tc else None
+        except Exception: pass
+
+    corp_announcements = fetch_nse_corporate_announcements()
+    mode = st.radio("व्यू चुनें", ["📋 पूरी Watchlist Radar", "🔎 सिंगल स्टॉक Deep-Dive"], horizontal=True)
+
+    if mode == "🔎 सिंगल स्टॉक Deep-Dive":
+        stock = st.selectbox("स्टॉक चुनें", list(st.session_state.all_tf_signals_map.keys()) or selected_stocks)
+        if st.button("🤖 Hypothesis बनाएं"):
+            with st.spinner("News evidence collect हो रहा है..."):
+                news_items = fetch_stock_news_items_full(stock)
+            h = build_hypothesis(stock, None, st.session_state.all_tf_signals_map.get(stock, {}),
+                                  news_items, corp_announcements, macro_quotes, sector_quotes,
+                                  fii_net_val, dii_net_val, pcr_value)
+            render_hypothesis_card(h)
+    else:
+        if st.button("📋 Watchlist Radar बनाएं (बिना News — तेज़)"):
+            rows = []
+            for stock in st.session_state.all_tf_signals_map.keys():
+                h = build_hypothesis(stock, None, st.session_state.all_tf_signals_map.get(stock, {}),
+                                      None, corp_announcements, macro_quotes, sector_quotes,
+                                      fii_net_val, dii_net_val, pcr_value)
+                rows.append({"स्टॉक": stock, "Label": h.label, "Score": h.score,
+                            "भरोसा": h.confidence_label, "बुलिश": h.bullish_count, "बेयरिश": h.bearish_count})
+            df = pd.DataFrame(rows).sort_values("Score", key=abs, ascending=False)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("💡 News evidence के लिए ऊपर 'Single स्टॉक Deep-Dive' इस्तेमाल करें।")
+
+
+def render_alerts_tab():
+    st.subheader("🔔 Live Signal & D&S Zone Alerts")
+    alerts = sorted(st.session_state.alerts, key=lambda a: a["logged_at"], reverse=True)
+    st.metric("कुल Active Alerts", len(alerts))
+    if not alerts:
+        st.info("अभी कोई अलर्ट नहीं है।")
+        return
+    adf = pd.DataFrame(alerts)
+    if "category" not in adf.columns: adf["category"] = "—"
+    adf = adf[["stars", "category", "stock", "tf", "type", "time", "logged_at", "chart"]]
+    adf.columns = ["सिग्नल", "कैटेगरी", "एसेट", "टाइमफ्रेम", "टाइप", "बार टाइम", "मिला", "Chart"]
+    if is_mobile_view:
+        for _, row in adf.iterrows():
+            st.markdown(f"**{row['सिग्नल']} · {row['एसेट']}** ({row['टाइमफ्रेम']})  \n{row['टाइप']}  \n"
+                        f"⏱ {row['बार टाइम']} · [📈 Chart]({row['Chart']})")
+            st.markdown("---")
+    else:
+        st.dataframe(adf, use_container_width=True, hide_index=True,
+                    column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈 खोलें")})
+    if st.button("🗑️ सभी Alerts साफ करें"):
+        st.session_state.alerts = []
+        st.rerun()
+
+
+def render_global_tab():
+    st.subheader("🌍 Global Markets")
+    global_yf_tickers = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
+    global_quotes = get_quotes(global_yf_tickers)
+    ref_rows = []
+    for sym, name, yft, tvs in GLOBAL_INSTRUMENTS:
+        q = global_quotes.get(yft) if yft else None
+        ref_rows.append({"Symbol": sym, "Name": name, "Price": f"{q['price']:.2f}" if q else "—",
+                         "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—", "Chart": tv_link(tvs)})
+    ref_df = pd.DataFrame(ref_rows)
+    st.dataframe(style_pct_columns(ref_df, ["Change"]), use_container_width=True, hide_index=True,
+                column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈")})
+
+
+def render_watchlist_tab():
+    if st.button("▶️ Watchlist Load करें", key="btn_watchlist"):
+        s_quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
+        with st.spinner("News चेक हो रही है..."):
+            news_links = fetch_news_links_parallel(selected_stocks)
+        rows = []
+        for s in selected_stocks:
+            q = s_quotes.get(yf_ticker_for_stock(s))
+            rows.append({"Stock": s, "LTP": f"{q['price']:.2f}" if q else "—",
+                        "Change": fmt_change(q.get("chg"), q.get("pct")) if q else "—",
+                        "Chart": tv_link(tv_symbol_for_stock(s)), "News": news_links.get(s)})
+        sdf = pd.DataFrame(rows)
+        st.dataframe(style_pct_columns(sdf, ["Change"]), use_container_width=True, hide_index=True,
+                    column_config={"Chart": st.column_config.LinkColumn("Chart", display_text="📈"),
+                                  "News": st.column_config.LinkColumn("News", display_text="📰")})
+    else:
+        st.info("💡 ऊपर बटन दबाएं।")
+
+
+def render_sector_tab():
+    if st.button("▶️ Sector Data Load करें", key="btn_sector"):
+        sector_quotes = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
+        sec_rows = [{"Sector": name, "% Chg": f"{sector_quotes[yft]['pct']:+.2f}%" if yft in sector_quotes else "—"}
+                    for name, yft in SECTOR_INDEX_TICKERS.items()]
+        st.dataframe(style_pct_columns(pd.DataFrame(sec_rows), ["% Chg"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 ऊपर बटन दबाएं।")
+
+
+def render_fii_tab():
+    if st.button("▶️ FII/DII + Nifty Load करें", key="btn_fii"):
+        fii_df, source = fetch_fii_dii()
+        if fii_df is not None:
+            st.dataframe(fii_df, use_container_width=True, hide_index=True)
+            insight = fii_dii_insight(fii_df)
+            if insight: getattr(st, insight[0])(insight[1])
+            st.caption(f"Source: {source}")
+        oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+        if oc_data:
+            try:
+                records, spot = oc_data["records"]["data"], oc_data["records"]["underlyingValue"]
+                call_oi = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
+                put_oi = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
+                pcr = round(sum(put_oi.values()) / sum(call_oi.values()), 2) if call_oi else None
+                st.metric("Nifty Spot", f"{spot:.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("PCR", pcr or "—")
+                c2.metric("Resistance", max(call_oi, key=call_oi.get) if call_oi else "—")
+                c3.metric("Support", max(put_oi, key=put_oi.get) if put_oi else "—")
+            except Exception: st.warning("Option data parse नहीं हो पाया।")
+    else:
+        st.info("💡 ऊपर बटन दबाएं।")
+
+
+def render_calendar_tab():
+    if st.button("▶️ Calendar Load करें", key="btn_cal"):
+        components.html("""<div class="tradingview-widget-container">
+          <div class="tradingview-widget-container__widget"></div>
+          <script src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
+          {"colorTheme":"light","isTransparent":false,"width":"100%","height":"600","locale":"en",
+           "importanceFilter":"0,1","countryFilter":"us,in,cn,jp,gb,eu"}</script></div>""", height=620)
+    else:
+        st.info("💡 ऊपर बटन दबाएं।")
+
+
+def render_movers_tab():
+    if st.button("▶️ Gainers/Losers Load करें", key="btn_mov"):
+        quotes = get_quotes([yf_ticker_for_stock(s) for s in selected_stocks])
+        mv_rows = []
+        for s in selected_stocks:
+            qd = quotes.get(yf_ticker_for_stock(s))
+            if qd: mv_rows.append({"Stock": s, "LTP": qd["price"], "pct": qd["pct"], "chg": qd.get("chg"),
+                                   "Chart": tv_link(tv_symbol_for_stock(s))})
+        mv_df = pd.DataFrame(mv_rows)
+        if not mv_df.empty:
+            gainers = mv_df.sort_values("pct", ascending=False).head(5).copy()
+            losers = mv_df.sort_values("pct", ascending=True).head(5).copy()
+            for _df in (gainers, losers):
+                _df["Change"] = _df.apply(lambda r: fmt_change(r["chg"], r["pct"]), axis=1)
+                _df.drop(columns=["pct", "chg"], inplace=True)
+            st.markdown("#### 🟢 Top Gainers")
+            st.dataframe(style_pct_columns(gainers, ["Change"]), use_container_width=True, hide_index=True)
+            st.markdown("#### 🔴 Top Losers")
+            st.dataframe(style_pct_columns(losers, ["Change"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 ऊपर बटन दबाएं।")
+
+
+# ==========================================
+# 9. RENDER (Mobile selectbox OR Desktop tabs)
+# ==========================================
+if is_mobile_view:
+    if section == "📊 Signals": render_signals_tab()
+    elif section == "🤖 AI Hypothesis": render_ai_hypothesis_tab()
+    elif section == "🔔 Alerts": render_alerts_tab()
+    elif section == "🌍 Global": render_global_tab()
+    elif section == "📋 Watchlist": render_watchlist_tab()
+    elif section == "🏭 Sector": render_sector_tab()
+    elif section == "💰 FII/DII+Nifty": render_fii_tab()
+    elif section == "🗓️ Calendar": render_calendar_tab()
+    elif section == "🏆 Movers": render_movers_tab()
+else:
+    with tabs[0]: render_signals_tab()
+    with tabs[1]: render_ai_hypothesis_tab()
+    with tabs[2]: render_alerts_tab()
+    with tabs[3]: render_global_tab()
+    with tabs[4]: render_watchlist_tab()
+    with tabs[5]: render_sector_tab()
+    with tabs[6]: render_fii_tab()
+    with tabs[7]: render_calendar_tab()
+    with tabs[8]: render_movers_tab()
