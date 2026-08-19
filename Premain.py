@@ -1,11 +1,13 @@
 """
 app.py — Full Market Dashboard (Streamlit) + Incremental D&S Cache + AI Hypothesis + Market Pulse
++ 🆕 Persistent Daily Data Store (News/Events/FII-DII) with Auto-Clear at 11 PM IST
 =====================================================================================
 Institutional D&S Zones (incremental/cached scan, sensitivity-mode) | EMA/Volume/RSI Signals |
 Global Markets | Sector Impact | Watchlist | Economic Calendar | FII/DII + Nifty OI |
 Delivery% + Bulk/Block Deals | Gainers/Losers | Evidence-Based AI Buy/Sell Hypothesis |
 🌅 Market Pulse (Pre-Market / Live Snapshot: GIFT Nifty, Nifty/BankNifty, Sectors, Global,
-OI/PCR, FII/DII, Heavyweights, News, Overall Bias) | Mobile-Friendly UI.
+OI/PCR, FII/DII, Heavyweights, News, Overall Bias) | Mobile-Friendly UI |
+🗄️ Daily Data Log (दिनभर जमा News/Events/FII-DII, evidence-based वॉचलिस्ट इम्पैक्ट, रात 11 बजे ऑटो-क्लियर)
 
 ⚠️ EDUCATIONAL / INFORMATIONAL TOOL — SEBI-registered निवेश सलाह नहीं है।
 """
@@ -457,7 +459,6 @@ def scan_institutional_ds_zones_incremental(df: pd.DataFrame, symbol: str, tf_ke
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-ALERT_CLEAR_HOUR_IST = 20
 
 COLOR_POS_BG, COLOR_POS_TEXT = "#d4f8d4", "#0a7d2f"
 COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8f8d4", "#c0392b"
@@ -631,17 +632,22 @@ def fmt_change(chg, pct):
 
 
 # ============================== TIMEFRAMES ==============================
+# 🆕 2 Hours और 6 Hours टाइमफ्रेम जोड़े गए
 TIMEFRAMES = {
     "3 Min":   {"interval": "1m",  "period": "5d",  "resample": "3min",  "intraday": True},
     "5 Min":   {"interval": "5m",  "period": "5d",  "resample": None,    "intraday": True},
     "15 Min":  {"interval": "5m",  "period": "5d",  "resample": "15min", "intraday": True},
     "30 Min":  {"interval": "15m", "period": "1mo", "resample": "30min", "intraday": True},
     "1 Hour":  {"interval": "60m", "period": "1mo", "resample": None,    "intraday": True},
+    "2 Hours": {"interval": "60m", "period": "2mo", "resample": "120min", "intraday": True},  # 🆕
     "4 Hours": {"interval": "60m", "period": "3mo", "resample": "240min", "intraday": True},
+    "6 Hours": {"interval": "60m", "period": "3mo", "resample": "360min", "intraday": True},  # 🆕
     "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
 }
 
-TF_MINUTES = {"3 Min": 3, "5 Min": 5, "15 Min": 15, "30 Min": 30, "1 Hour": 60, "4 Hours": 240, "Daily": 1440}
+# 🆕 नए टाइमफ्रेम के साथ अपडेटेड
+TF_MINUTES = {"3 Min": 3, "5 Min": 5, "15 Min": 15, "30 Min": 30, "1 Hour": 60,
+              "2 Hours": 120, "4 Hours": 240, "6 Hours": 360, "Daily": 1440}
 
 def _build_lower_tf_map() -> Dict[str, Optional[str]]:
     ordered = sorted(TF_MINUTES.items(), key=lambda kv: kv[1])
@@ -747,6 +753,136 @@ def check_ds_zones(df: pd.DataFrame, symbol: str, tf_key: str,
     if signals:
         return " | ".join(signals), is_hq_signal, best_zone_detail
     return None, False, None
+
+
+# ==========================================
+# 🆕 3c. PERSISTENT DAILY DATA STORE (News/Events/FII-DII)
+#      — दिनभर जमा होता रहता है, रात 11 बजे (IST) ऑटो-क्लियर
+# ==========================================
+DAILY_CLEAR_HOUR_IST = 23  # रात 11 बजे — इस समय के बाद पूरा दिनभर का जमा डेटा साफ हो जाएगा
+
+def _empty_daily_store() -> Dict[str, Any]:
+    return {
+        "market_news": [],        # पूरे मार्केट की headlines (dedup by link)
+        "stock_news": {},         # {stock: [news_items,...]}
+        "corp_announcements": [], # NSE corporate announcements (dedup)
+        "fii_dii_log": [],        # [{time, fii_net, dii_net, source}, ...] — दिनभर का trail
+        "seen_news_links": set(), # dedup helper
+    }
+
+def get_daily_store() -> Dict[str, Any]:
+    """सेशन-लेवल डेली डेटा स्टोर — पूरे दिन में मिलने वाली news/events/FII-DII डेटा यहां
+    जमा होते रहते हैं (ताकि बार-बार भारी fetch न करना पड़े और 'लेटेस्ट न्यूज' सर्च हल्का रहे),
+    और रात 11 बजे (नीचे maybe_clear_all_daily_data) अपने-आप खाली हो जाते हैं।"""
+    if "daily_store" not in st.session_state:
+        st.session_state.daily_store = _empty_daily_store()
+    return st.session_state.daily_store
+
+def maybe_clear_all_daily_data():
+    """🆕 रात 11 बजे (IST) के बाद — दिन में पहली बार आने पर — सारा जमा डेटा (News, Corporate
+    Announcements, FII/DII trail, D&S Zone Cache, Alerts, Signal Map) रीसेट कर देता है ताकि
+    अगले दिन सुबह से बिल्कुल ताज़ा (fresh) शुरुआत हो और पुराने दिन का institutional context
+    नए दिन के signals को गलत तरीके से प्रभावित न करे।"""
+    if "daily_clear_date" not in st.session_state:
+        st.session_state.daily_clear_date = None
+    today = now_ist().date()
+    if now_ist().time() >= dtime(DAILY_CLEAR_HOUR_IST, 0):
+        if st.session_state.daily_clear_date != today:
+            st.session_state.daily_store = _empty_daily_store()
+            st.session_state.ds_zone_cache = {}
+            st.session_state.alerts = []
+            st.session_state.all_tf_signals_map = {}
+            st.cache_data.clear()
+            st.session_state.daily_clear_date = today
+
+def update_and_get_daily_market_news(max_items: int = 10) -> List[Dict[str, Any]]:
+    """नई news नेटवर्क से केवल हर ~10 मिनट में एक बार आती है (नीचे fetch_market_wide_news
+    पहले से @st.cache_data(ttl=600) से cached है) — यहां सिर्फ उसे दिनभर के संचित स्टोर में
+    dedup करके जोड़ा जाता है, इसलिए 'latest news' ढूंढना हमेशा हल्का रहता है।"""
+    store = get_daily_store()
+    fresh_items = fetch_market_wide_news(max_items=max_items)
+    for item in fresh_items:
+        link = item.get("link")
+        if link and link not in store["seen_news_links"]:
+            store["seen_news_links"].add(link)
+            store["market_news"].append(item)
+    store["market_news"].sort(
+        key=lambda x: x.get("published") or datetime.min.replace(tzinfo=timezone.utc), reverse=True
+    )
+    return store["market_news"]
+
+def update_and_get_stock_news(stock: str, max_items: int = 6) -> List[Dict[str, Any]]:
+    """किसी एक स्टॉक की news भी दिनभर संचित होती है — पुरानी महत्वपूर्ण खबर भी evidence में बनी रहती है।"""
+    store = get_daily_store()
+    fresh_items = fetch_stock_news_items_full(stock, max_items=max_items)
+    bucket = store["stock_news"].setdefault(stock, [])
+    existing_links = {it.get("link") for it in bucket}
+    for item in fresh_items:
+        link = item.get("link")
+        if link and link not in existing_links:
+            bucket.append(item)
+            existing_links.add(link)
+    bucket.sort(key=lambda x: x.get("published") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return bucket
+
+def update_and_get_corp_announcements() -> List[Dict[str, Any]]:
+    store = get_daily_store()
+    fresh = fetch_nse_corporate_announcements()
+    existing_keys = {(a.get("symbol"), a.get("subject"), str(a.get("time"))) for a in store["corp_announcements"]}
+    for a in fresh:
+        k = (a.get("symbol"), a.get("subject"), str(a.get("time")))
+        if k not in existing_keys:
+            store["corp_announcements"].append(a)
+            existing_keys.add(k)
+    return store["corp_announcements"]
+
+def update_and_get_fii_dii_log() -> Tuple[Optional[pd.DataFrame], Optional[str], List[Dict[str, Any]]]:
+    """FII/DII का हर बदलाव समय के साथ लॉग होता है ताकि दिनभर का trend evidence के तौर पर दिखे।"""
+    store = get_daily_store()
+    fii_df, source = fetch_fii_dii()
+    if fii_df is not None:
+        try:
+            net_col = [c for c in fii_df.columns if "net" in c.lower()][0]
+            cat_col = [c for c in fii_df.columns if "cat" in c.lower()][0]
+            fii_net = dii_net = None
+            for _, r in fii_df.iterrows():
+                if "FII" in str(r[cat_col]).upper(): fii_net = float(r[net_col])
+                elif "DII" in str(r[cat_col]).upper(): dii_net = float(r[net_col])
+            ts = now_ist().strftime("%H:%M")
+            last_entry = store["fii_dii_log"][-1] if store["fii_dii_log"] else None
+            if last_entry is None or last_entry.get("fii_net") != fii_net or last_entry.get("dii_net") != dii_net:
+                store["fii_dii_log"].append({"time": ts, "fii_net": fii_net, "dii_net": dii_net, "source": source})
+        except Exception:
+            pass
+    return fii_df, source, store["fii_dii_log"]
+
+def collect_daily_market_mentions_evidence(stock: str) -> List["EvidenceItem"]:
+    """🆕 दिनभर जमा हुई मार्केट-वाइड news + corporate announcements में स्टॉक के नाम का
+    ज़िक्र ढूंढकर evidence-based bullish/bearish असर निकालता है — बिना किसी नए network-call के
+    (डेटा पहले से daily_store में मौजूद है, इसलिए ज़ीरो अतिरिक्त लोड)।"""
+    store = get_daily_store()
+    evid: List[EvidenceItem] = []
+    stock_lower = stock.lower()
+    for item in store["market_news"]:
+        title = item.get("title", "")
+        if stock_lower in title.lower():
+            res = score_text_sentiment(title)
+            if res["direction"] != "neutral":
+                conf = _freshness_confidence(item.get("published"))
+                evid.append(EvidenceItem("संचित Market News (आज)", f"'{title[:90]}'",
+                                          res["direction"], W_NEWS_KEYWORD, conf, item.get("published_str", "")))
+    for ann in store["corp_announcements"]:
+        if str(ann.get("symbol", "")).strip().upper() != stock.upper():
+            continue
+        subj = ann.get("subject", "")
+        if not subj:
+            continue
+        res = score_text_sentiment(subj)
+        if res["direction"] != "neutral":
+            evid.append(EvidenceItem("संचित Corporate Announcement (आज)", f"'{subj[:90]}'",
+                                      res["direction"], W_CORP_ANNOUNCE, 0.9, str(ann.get("time", ""))))
+    return evid
+
 
 # ==========================================
 # 4. AI EVIDENCE-BASED BUY/SELL HYPOTHESIS ENGINE
@@ -1046,6 +1182,7 @@ def build_hypothesis(stock, price, tf_signals, news_items=None, corp_announcemen
     all_evidence: List[EvidenceItem] = []
     all_evidence += collect_technical_evidence(stock, tf_signals or {})
     all_evidence += collect_news_evidence(stock, news_items or [], corp_announcements or [])
+    all_evidence += collect_daily_market_mentions_evidence(stock)  # 🆕 दिनभर जमा संचित News/Announcements
     all_evidence += collect_macro_evidence(stock, macro_quotes or {})
     all_evidence += collect_sector_evidence(stock, sector_quotes or {})
     all_evidence += collect_fii_dii_evidence(fii_net, dii_net)
@@ -1071,6 +1208,12 @@ def build_hypothesis(stock, price, tf_signals, news_items=None, corp_announcemen
                        bearish_count, all_evidence, entry, sl, tp, zone_tf)
 
 def fetch_stock_news_items_full(stock_name: str, max_items: int = 6) -> List[Dict[str, Any]]:
+    """🆕 अब ttl=600 (10 मिनट) cache के साथ — बार-बार एक ही स्टॉक की news भारी fetch नहीं करेगा,
+    ऊपर update_and_get_stock_news() इसे दिनभर के संचित स्टोर में जोड़ता है।"""
+    return _fetch_stock_news_items_full_cached(stock_name, max_items)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_stock_news_items_full_cached(stock_name: str, max_items: int = 6) -> List[Dict[str, Any]]:
     if feedparser is None: return []
     query = urllib.parse.quote_plus(f"{stock_name} NSE when:1d")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -1141,7 +1284,7 @@ def build_market_overall_bias(idx_quotes: Dict[str, Dict[str, Any]],
             evid.append(EvidenceItem("Options - Nifty PCR", f"PCR {pcr_value} (<0.80) — call-heavy bearish bias",
                                       "bearish", W_OPTIONS_PCR, 0.6))
 
-    for item in (market_news or [])[:8]:
+    for item in (market_news or [])[:15]:
         res = score_text_sentiment(item.get("title", ""))
         if res["direction"] != "neutral":
             conf = _freshness_confidence(item.get("published"))
@@ -1167,6 +1310,8 @@ if HAS_AUTOREFRESH:
 
 st.sidebar.markdown(f"🕒 IST: **{now_ist().strftime('%d-%b-%Y %H:%M:%S')}**")
 st.sidebar.markdown("🟢 भारतीय बाज़ार खुला" if is_market_hours() else "🔴 भारतीय बाज़ार बंद")
+st.sidebar.caption(f"🗑️ रात {DAILY_CLEAR_HOUR_IST}:00 बजे (IST) दिनभर का जमा डेटा "
+                    "(News, Announcements, D&S Cache, Alerts) ऑटो-क्लियर होगा — अगला दिन ताज़ा शुरू होगा।")
 if st.sidebar.button("🔄 अभी Refresh करें"):
     st.cache_data.clear()
     st.session_state.ds_zone_cache = {}  # जानबूझकर पूरा clear — user खुद चाहता है fresh scan
@@ -1179,7 +1324,11 @@ st.sidebar.subheader("📊 Signal & Scan Settings")
 scan_scope = st.sidebar.multiselect("Scan Scope", ["Indian Watchlist", "Global Markets"],
                                      default=["Indian Watchlist", "Global Markets"])
 tf_options = ["ALL"] + list(TIMEFRAMES.keys())
-selected_tf_raw = st.sidebar.multiselect("Signal Scan Timeframes", tf_options, default=["5 Min", "1 Hour", "Daily"])
+# 🆕 डिफ़ॉल्ट टाइमफ्रेम अब: 15 मिनट, 30 मिनट, 1, 2, 4 घंटे और Daily
+selected_tf_raw = st.sidebar.multiselect(
+    "Signal Scan Timeframes", tf_options,
+    default=["15 Min", "30 Min", "1 Hour", "2 Hours", "4 Hours", "Daily"]
+)
 signal_timeframes = list(TIMEFRAMES.keys()) if "ALL" in selected_tf_raw else selected_tf_raw
 
 selected_indicators = st.sidebar.multiselect(
@@ -1244,16 +1393,11 @@ def get_gift_nifty_display() -> str:
     return "उपलब्ध नहीं — sidebar से डालें"
 
 if "alerts" not in st.session_state: st.session_state.alerts = []
-if "alerts_clear_date" not in st.session_state: st.session_state.alerts_clear_date = None
 if "all_tf_signals_map" not in st.session_state: st.session_state.all_tf_signals_map = {}
+if "ds_zone_cache" not in st.session_state: st.session_state.ds_zone_cache = {}
 
-def maybe_clear_alerts():
-    today = now_ist().date()
-    if now_ist().time() >= dtime(ALERT_CLEAR_HOUR_IST, 0):
-        if st.session_state.alerts_clear_date != today:
-            st.session_state.alerts = []
-            st.session_state.alerts_clear_date = today
-maybe_clear_alerts()
+# 🆕 पुराने 20:00 वाले अलर्ट-क्लियर की जगह अब यूनिफाइड 23:00 (रात 11 बजे) डेली-क्लियर
+maybe_clear_all_daily_data()
 
 
 # ==========================================
@@ -1398,7 +1542,9 @@ def fetch_nse_corporate_announcements():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_market_wide_news(max_items=10) -> List[Dict[str, Any]]:
-    """🆕 पूरे मार्केट (Nifty/Sensex/भारतीय बाज़ार) से जुड़ी ताज़ा headlines — Market Pulse के लिए।"""
+    """पूरे मार्केट (Nifty/Sensex/भारतीय बाज़ार) से जुड़ी ताज़ा headlines — Market Pulse के लिए।
+    ttl=600 (10 मिनट) cache — इसलिए बार-बार कॉल करने पर भी नेटवर्क लोड नहीं बढ़ता,
+    ऊपर update_and_get_daily_market_news() इसे दिनभर के संचित स्टोर में जोड़ता रहता है।"""
     if feedparser is None:
         return []
     query = urllib.parse.quote_plus("Nifty Sensex Indian stock market when:1d")
@@ -1479,9 +1625,9 @@ def render_market_pulse():
     else:
         st.caption("Option chain data अभी उपलब्ध नहीं (NSE rate-limit हो सकता है)।")
 
-    # --- Row 5: FII / DII ---
-    st.markdown("#### 💰 FII / DII (पिछला EOD)")
-    fii_df, source = fetch_fii_dii()
+    # --- Row 5: FII / DII (🆕 अब दिनभर के trail के साथ) ---
+    st.markdown("#### 💰 FII / DII (पिछला EOD + आज का Trail)")
+    fii_df, source, fii_log = update_and_get_fii_dii_log()
     fii_net_val = dii_net_val = None
     if fii_df is not None:
         st.dataframe(fii_df, use_container_width=True, hide_index=True)
@@ -1498,6 +1644,9 @@ def render_market_pulse():
         st.caption(f"Source: {source}")
     else:
         st.caption("FII/DII data अभी उपलब्ध नहीं।")
+    if len(fii_log) > 1:
+        with st.expander(f"📈 आज का FII/DII Trail ({len(fii_log)} स्नैपशॉट्स)"):
+            st.dataframe(pd.DataFrame(fii_log), use_container_width=True, hide_index=True)
 
     # --- Row 6: प्रमुख स्टॉक्स ---
     st.markdown("#### 🏆 प्रमुख स्टॉक्स (Nifty Heavyweights)")
@@ -1512,13 +1661,14 @@ def render_market_pulse():
     else:
         st.caption("Heavyweight quotes उपलब्ध नहीं।")
 
-    # --- Row 7: ताज़ा News ---
-    st.markdown("#### 📰 ताज़ा Market News")
+    # --- Row 7: ताज़ा News (🆕 दिनभर संचित) ---
+    st.markdown("#### 📰 ताज़ा Market News (आज का संचित लॉग)")
     with st.spinner("News scan हो रहा है..."):
-        market_news = fetch_market_wide_news()
+        market_news = update_and_get_daily_market_news()
     if market_news:
         for item in market_news[:8]:
             st.markdown(f"- [{item['title']}]({item['link']}) · _{item['published_str']}_")
+        st.caption(f"कुल आज जमा: {len(market_news)} headlines — पूरा लॉग '🗄️ Daily Log' टैब में देखें।")
     else:
         st.caption("कोई ताज़ा news नहीं मिली।")
 
@@ -1547,7 +1697,8 @@ st.caption("⚠️ EDUCATIONAL टूल — SEBI-registered निवेश स
 # ==========================================
 # 8. TABS
 # ==========================================
-tab_names = ["📊 Signals", "🤖 AI Hypothesis", "🔔 Alerts", "🌍 Global", "📋 Watchlist",
+# 🆕 नया टैब जोड़ा गया: "🗄️ Daily Log"
+tab_names = ["📊 Signals", "🤖 AI Hypothesis", "🗄️ Daily Log", "🔔 Alerts", "🌍 Global", "📋 Watchlist",
              "🏭 Sector", "💰 FII/DII+Nifty", "🗓️ Calendar", "🏆 Movers"]
 
 if is_mobile_view:
@@ -1754,7 +1905,7 @@ def render_ai_hypothesis_tab():
     macro_quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
     sector_quotes_raw = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
     sector_quotes = {name: sector_quotes_raw.get(yft, {}).get("pct") for name, yft in SECTOR_INDEX_TICKERS.items()}
-    fii_df, _ = fetch_fii_dii()
+    fii_df, _, _ = update_and_get_fii_dii_log()
     fii_net_val = dii_net_val = None
     if fii_df is not None:
         try:
@@ -1775,20 +1926,20 @@ def render_ai_hypothesis_tab():
             pcr_value = round(tp / tc, 2) if tc else None
         except Exception: pass
 
-    corp_announcements = fetch_nse_corporate_announcements()
+    corp_announcements = update_and_get_corp_announcements()  # 🆕 दिनभर संचित
     mode = st.radio("व्यू चुनें", ["📋 पूरी Watchlist Radar", "🔎 सिंगल स्टॉक Deep-Dive"], horizontal=True)
 
     if mode == "🔎 सिंगल स्टॉक Deep-Dive":
         stock = st.selectbox("स्टॉक चुनें", list(st.session_state.all_tf_signals_map.keys()) or selected_stocks)
         if st.button("🤖 Hypothesis बनाएं"):
             with st.spinner("News evidence collect हो रहा है..."):
-                news_items = fetch_stock_news_items_full(stock)
+                news_items = update_and_get_stock_news(stock)  # 🆕 दिनभर संचित
             h = build_hypothesis(stock, None, st.session_state.all_tf_signals_map.get(stock, {}),
                                   news_items, corp_announcements, macro_quotes, sector_quotes,
                                   fii_net_val, dii_net_val, pcr_value)
             render_hypothesis_card(h)
     else:
-        if st.button("📋 Watchlist Radar बनाएं (बिना News — तेज़)"):
+        if st.button("📋 Watchlist Radar बनाएं (बिना नई News fetch — तेज़, संचित डेटा इस्तेमाल)"):
             rows = []
             for stock in st.session_state.all_tf_signals_map.keys():
                 h = build_hypothesis(stock, None, st.session_state.all_tf_signals_map.get(stock, {}),
@@ -1798,7 +1949,83 @@ def render_ai_hypothesis_tab():
                             "भरोसा": h.confidence_label, "बुलिश": h.bullish_count, "बेयरिश": h.bearish_count})
             df = pd.DataFrame(rows).sort_values("Score", key=abs, ascending=False)
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption("💡 News evidence के लिए ऊपर 'Single स्टॉक Deep-Dive' इस्तेमाल करें।")
+            st.caption("💡 यह result में संचित market-news mentions + corp announcements + technical + "
+                       "macro/sector/FII-DII/PCR evidence शामिल है। पूरी stock-specific news के लिए "
+                       "'Single स्टॉक Deep-Dive' इस्तेमाल करें।")
+
+
+def render_daily_log_tab():
+    """🆕 दिनभर जमा हुए महत्वपूर्ण मार्केट इवेंट/न्यूज/डेटा का लॉग + वॉचलिस्ट पर evidence-based असर।
+    रात 11 बजे (IST) यह सब ऑटोमेटिक क्लियर हो जाता है।"""
+    st.subheader("🗄️ आज का जमा डेटा (Daily Persistent Store)")
+    store = get_daily_store()
+    now = now_ist()
+    clear_dt = now.replace(hour=DAILY_CLEAR_HOUR_IST, minute=0, second=0, microsecond=0)
+    remaining = clear_dt - now
+    if remaining.total_seconds() < 0:
+        st.warning("🌙 रात 11 बजे के बाद — डेटा जल्द ही ऑटो-क्लियर होगा / हो चुका है।")
+    else:
+        hrs, rem = divmod(int(remaining.total_seconds()), 3600)
+        mins = rem // 60
+        st.info(f"⏳ अगला ऑटो-क्लियर रात 11:00 बजे — लगभग {hrs} घंटे {mins} मिनट बाकी।")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("संचित Market News", len(store["market_news"]))
+    c2.metric("Corporate Announcements", len(store["corp_announcements"]))
+    c3.metric("FII/DII स्नैपशॉट्स", len(store["fii_dii_log"]))
+
+    if st.button("🔄 अभी डेटा Update करें (हल्का — सिर्फ नया merge होगा)"):
+        with st.spinner("नया डेटा merge हो रहा है..."):
+            update_and_get_daily_market_news()
+            update_and_get_corp_announcements()
+            update_and_get_fii_dii_log()
+        st.success("अपडेट हो गया — सिर्फ नई entries जोड़ी गईं, पूरा दोबारा fetch नहीं हुआ।")
+
+    st.markdown("#### 📰 आज की संचित Market News")
+    if store["market_news"]:
+        for item in store["market_news"][:30]:
+            st.markdown(f"- [{item['title']}]({item['link']}) · _{item.get('published_str','')}_")
+    else:
+        st.caption("अभी तक कोई news जमा नहीं — ऊपर बटन दबाकर Update करें।")
+
+    st.markdown("#### 📢 Corporate Announcements (संचित)")
+    if store["corp_announcements"]:
+        ann_df = pd.DataFrame(store["corp_announcements"][:30])
+        st.dataframe(ann_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("अभी कोई announcement जमा नहीं।")
+
+    st.markdown("#### 💰 FII/DII Trail (आज)")
+    if store["fii_dii_log"]:
+        st.dataframe(pd.DataFrame(store["fii_dii_log"]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("अभी कोई FII/DII स्नैपशॉट जमा नहीं।")
+
+    st.markdown("---")
+    st.markdown("#### 🎯 वॉचलिस्ट पर संचित न्यूज़ का Evidence-Based असर")
+    st.caption("दिनभर जमा हुई Market News + Corporate Announcements में वॉचलिस्ट स्टॉक्स के ज़िक्र को स्कैन करके "
+               "bullish/bearish evidence दिखाया गया है — बिना किसी नए भारी fetch के (पूरी तरह session-cached)।")
+    if st.button("🔍 वॉचलिस्ट Impact स्कैन करें"):
+        rows = []
+        for stock in selected_stocks:
+            evid = collect_daily_market_mentions_evidence(stock)
+            if not evid:
+                continue
+            bull = sum(1 for e in evid if e.direction == "bullish")
+            bear = sum(1 for e in evid if e.direction == "bearish")
+            rows.append({"Stock": stock, "बुलिश Evidence": bull, "बेयरिश Evidence": bear,
+                        "टॉप डिटेल": evid[0].detail[:80]})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("अभी वॉचलिस्ट स्टॉक्स से जुड़ी कोई संचित न्यूज़/announcement नहीं मिली। "
+                    "ऊपर 'Update करें' बटन दबाकर पहले डेटा जमा करें।")
+
+    st.markdown("---")
+    if st.button("🗑️ अभी पूरा Daily Store मैन्युअली क्लियर करें"):
+        st.session_state.daily_store = _empty_daily_store()
+        st.success("Daily Store साफ कर दिया गया।")
+        st.rerun()
 
 
 def render_alerts_tab():
@@ -1870,12 +2097,15 @@ def render_sector_tab():
 
 def render_fii_tab():
     if st.button("▶️ FII/DII + Nifty Load करें", key="btn_fii"):
-        fii_df, source = fetch_fii_dii()
+        fii_df, source, fii_log = update_and_get_fii_dii_log()
         if fii_df is not None:
             st.dataframe(fii_df, use_container_width=True, hide_index=True)
             insight = fii_dii_insight(fii_df)
             if insight: getattr(st, insight[0])(insight[1])
             st.caption(f"Source: {source}")
+        if len(fii_log) > 1:
+            with st.expander(f"📈 आज का FII/DII Trail ({len(fii_log)} स्नैपशॉट्स)"):
+                st.dataframe(pd.DataFrame(fii_log), use_container_width=True, hide_index=True)
         oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
         if oc_data:
             try:
@@ -1933,6 +2163,7 @@ def render_movers_tab():
 if is_mobile_view:
     if section == "📊 Signals": render_signals_tab()
     elif section == "🤖 AI Hypothesis": render_ai_hypothesis_tab()
+    elif section == "🗄️ Daily Log": render_daily_log_tab()
     elif section == "🔔 Alerts": render_alerts_tab()
     elif section == "🌍 Global": render_global_tab()
     elif section == "📋 Watchlist": render_watchlist_tab()
@@ -1943,10 +2174,11 @@ if is_mobile_view:
 else:
     with tabs[0]: render_signals_tab()
     with tabs[1]: render_ai_hypothesis_tab()
-    with tabs[2]: render_alerts_tab()
-    with tabs[3]: render_global_tab()
-    with tabs[4]: render_watchlist_tab()
-    with tabs[5]: render_sector_tab()
-    with tabs[6]: render_fii_tab()
-    with tabs[7]: render_calendar_tab()
-    with tabs[8]: render_movers_tab()
+    with tabs[2]: render_daily_log_tab()
+    with tabs[3]: render_alerts_tab()
+    with tabs[4]: render_global_tab()
+    with tabs[5]: render_watchlist_tab()
+    with tabs[6]: render_sector_tab()
+    with tabs[7]: render_fii_tab()
+    with tabs[8]: render_calendar_tab()
+    with tabs[9]: render_movers_tab()
