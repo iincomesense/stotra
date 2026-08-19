@@ -428,3 +428,300 @@ def scan_institutional_ds_zones_incremental(df: pd.DataFrame, symbol: str, tf_ke
 
     st.session_state.ds_zone_cache[key] = {"zones": merged, "last_ts": last_bar_time}
     return merged
+
+# ==========================================
+# 3. GLOBAL MASTER LIST & MARKET TIME SETUP
+# ==========================================
+IST = timezone(timedelta(hours=5, minutes=30))
+MARKET_OPEN = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
+ALERT_CLEAR_HOUR_IST = 20
+
+COLOR_POS_BG, COLOR_POS_TEXT = "#d4f8d4", "#0a7d2f"
+COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8f8d4", "#c0392b"
+COLOR_FLAT_TEXT = "#555555"
+COLOR_SPIKE_BG = "#ffe1a8"
+
+RAW_STOCKS = """TCS,M&M,HCLTECH,SBIN,INFY,HINDUNILVR,RELIANCE,BHARTIARTL,BEL,ONGC,
+BAJAJ_AUTO,NESTLEIND,POWERGRID,ULTRACEMCO,ITC,ADANIPORTS,LT,COALINDIA,ADANIENT,
+SUNPHARMA,MARUTI,ETERNAL,HDFCBANK,JSWSTEEL,NTPC,ASIANPAINT,DMART,KOTAKBANK,
+TATASTEEL,TITAN,AXISBANK,SHRIRAMFIN,ICICIBANK,BAJFINANCE,TATAMOTORS,MOTHERSON,
+BRITANNIA,HEROMOTOCO,TVSMOTOR,PERSISTENT,TECHM,MCX,OIL,RECLTD,AUROPHARMA,COFORGE,
+BSE,LAURUSLABS,EICHERMOT,LUPIN,CUMMINSIND,MUTHOOTFIN,INDUSTOWER,MAXHEALTH,
+HINDALCO,JSWENERGY,BHARATFORG,WIPRO,HAVELLS,APLAPOLLO,TMPV,OBEROIRLTY,MARICO,
+KEI,SBILIFE,DABUR,TATAPOWER,INDIGO,MFSL,DIXON,SBICARD,SRF,VBL,PFC,GODREJCP,
+ASTRAL,UNITDSPR,GMRAIRPORT,IOC,HDFCAMC,TATACONSUM,HINDPETRO,LODHA,GRASIM,
+TIINDIA,TORNTPHARM,UPL,HDFCLIFE,CANBK,SIEMENS,CGPOWER,APOLLOHOSP,VEDL,PNB,
+FEDERALBNK,POLYCAB,PHOENIXLTD,AUBANK,INDUSINDBK,NAUKRI,ASHOKLEY,DIVISLAB,
+NATIONALUM,DRREDDY,CIPLA,JINDALSTEL,POLICYBZR,AMBUJACEM,INDHOTEL,BPCL,
+PIDILITIND,IDFCFIRSTB,ICICIGI,BANKBARODA,TMCV,JIOFIN,NMDC,CHOLAFIN,GAIL,TRENT"""
+
+WATCHLIST_DEFAULT = list(dict.fromkeys(
+    [s.strip() for s in RAW_STOCKS.replace("\n", "").split(",") if s.strip()]
+))
+
+YF_FIX = {"BAJAJ_AUTO": "BAJAJ-AUTO"}
+TV_FIX = {"BAJAJ_AUTO": "BAJAJ-AUTO"}
+
+GLOBAL_INSTRUMENTS = [
+    ("DXY", "US Dollar Index", "DX-Y.NYB", "TVC:DXY"),
+    ("USDINR", "USD / INR", "INR=X", "FX_IDC:USDINR"),
+    ("US10Y", "US 10-Yr Treasury Yield", "^TNX", "TVC:US10Y"),
+    ("TLT", "20+ Yr Treasury Bond ETF", "TLT", "NASDAQ:TLT"),
+    ("XAUUSD", "Gold / USD", "GC=F", "TVC:GOLD"),
+    ("XAGUSD", "Silver / USD", "SI=F", "TVC:SILVER"),
+    ("SPOTCRUDE", "WTI Crude Oil", "CL=F", "TVC:USOIL"),
+    ("COPPER", "Copper", "HG=F", "COMEX:HG1!"),
+    ("NATGAS", "Natural Gas", "NG=F", "NYMEX:NG1!"),
+    ("US30", "Dow Jones Industrial Avg", "^DJI", "TVC:DJI"),
+    ("US500", "S&P 500", "^GSPC", "TVC:SPX"),
+    ("000001", "Shanghai Composite (China)", "000001.SS", "SSE:000001"),
+    ("JP225", "Nikkei 225 (Japan)", "^N225", "TVC:NI225"),
+    ("FTSE100", "FTSE 100 (UK)", "^FTSE", "TVC:UKX"),
+]
+
+SECTOR_INDEX_TICKERS = {
+    "Nifty Bank": "^NSEBANK", "Nifty IT": "^CNXIT", "Nifty Auto": "^CNXAUTO",
+    "Nifty FMCG": "^CNXFMCG", "Nifty Pharma": "^CNXPHARMA", "Nifty Metal": "^CNXMETAL",
+    "Nifty Energy": "^CNXENERGY", "Nifty Realty": "^CNXREALTY",
+    "Nifty PSU Bank": "^CNXPSUBANK", "Nifty Financial Services": "^CNXFIN",
+}
+
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "*/*",
+    "Referer": "https://www.nseindia.com/",
+}
+
+# ============================== PAGE SETUP ==============================
+st.set_page_config(page_title="Full Market Dashboard & D&S Scanner", layout="wide",
+                    page_icon="📈", initial_sidebar_state="collapsed")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root {
+  --dh-bg: #F5F7FA; --dh-card: #FFFFFF; --dh-border: #E6E9F0;
+  --dh-text: #14151A; --dh-muted: #70758A;
+}
+html, body, [class^="css"], [class*=" css"] { font-family: 'Inter', sans-serif !important; }
+[data-testid="stAppViewContainer"], [data-testid="stHeader"], .main, section.main { background: var(--dh-bg) !important; }
+[data-testid="stHeader"] { background: transparent !important; }
+h1, h2, h3, h4 { color: var(--dh-text) !important; font-weight: 700 !important; }
+[data-testid="stCaptionContainer"] { color: var(--dh-muted) !important; font-size: 12.5px !important; }
+div[data-testid="stTabs"] div[role="tablist"] {
+  gap: 4px !important; background: var(--dh-card) !important; padding: 6px !important;
+  border-radius: 14px !important; border: 1px solid var(--dh-border) !important; overflow-x: auto;
+}
+div[data-testid="stTabs"] button[role="tab"] {
+  border-radius: 10px !important; padding: 9px 16px !important; font-weight: 600 !important;
+  font-size: 13.5px !important; color: var(--dh-muted) !important; background: transparent !important;
+}
+div[data-testid="stTabs"] button[aria-selected="true"] { background: #0B1F3A !important; color: #FFFFFF !important; }
+[data-testid="stDataFrame"] { border-radius: 12px !important; overflow: hidden; border: 1px solid var(--dh-border) !important; }
+div[data-testid="stMetric"] { background: var(--dh-card); border: 1px solid var(--dh-border); border-radius: 12px; padding: 14px 16px; }
+div[data-testid="stMetricValue"] { color: var(--dh-text) !important; font-weight: 800 !important; }
+[data-testid="stAlert"] { border-radius: 12px !important; }
+
+/* 🆕 MOBILE-FRIENDLY IMPROVEMENTS */
+@media (max-width: 768px) {
+    .block-container {padding-left: 0.5rem; padding-right: 0.5rem; padding-top: 0.6rem;}
+    div[data-testid="stMetricValue"] {font-size: 1.0rem;}
+    h1 {font-size: 1.3rem !important;} h2, h3 {font-size: 1.05rem !important;}
+    div[data-testid="stTabs"] button[role="tab"] { padding: 7px 10px !important; font-size: 12px !important; }
+    div[data-testid="stDataFrame"] { font-size: 11px !important; }
+}
+.signal-card {
+  background: #fff; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px;
+  border-left: 4px solid #ccc; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.signal-card.demand { border-left-color: #0a7d2f; background: #f2fbf2; }
+.signal-card.supply { border-left-color: #c0392b; background: #fdf2f2; }
+.signal-card.hq { border-left-color: #ffb400; background: #fff8e6; }
+.signal-title { font-weight: 700; font-size: 13.5px; color:#14151A; }
+.signal-sub { font-size: 12px; color: #666; margin-top: 2px; }
+.sticky-bar {
+  position: sticky; top: 0; z-index: 999; background: #0B1F3A; color: white;
+  padding: 8px 14px; border-radius: 8px; margin-bottom: 10px; font-size: 12.5px;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================== GENERAL HELPERS ==============================
+def now_ist():
+    return datetime.now(IST)
+
+def is_market_hours():
+    t = now_ist().time()
+    return MARKET_OPEN <= t <= MARKET_CLOSE and now_ist().weekday() < 5
+
+def tv_link(symbol):
+    return f"https://www.tradingview.com/chart/?symbol={urllib.parse.quote(symbol)}"
+
+def tv_symbol_for_stock(stock):
+    return f"NSE:{TV_FIX.get(stock, stock)}"
+
+def yf_ticker_for_stock(stock):
+    return f"{YF_FIX.get(stock, stock)}.NS"
+
+def _parse_pct(val):
+    if val is None: return None
+    if isinstance(val, (int, float)): return float(val)
+    s = str(val).strip()
+    if s in ("", "—", "-", "None", "nan"): return None
+    import re
+    m = re.search(r"\(([-+]?\d+\.?\d*)%\)", s)
+    if m:
+        try: return float(m.group(1))
+        except Exception: pass
+    s = s.replace("%", "").replace("+", "").replace("▲", "").replace("▼", "").replace("●", "").strip()
+    try: return float(s)
+    except Exception: return None
+
+def pct_bg_style(val):
+    v = _parse_pct(val)
+    if v is None: return ""
+    if v > 0: return f"background-color:{COLOR_POS_BG}; color:{COLOR_POS_TEXT}; font-weight:600;"
+    if v < 0: return f"background-color:{COLOR_NEG_BG}; color:{COLOR_NEG_TEXT}; font-weight:600;"
+    return f"color:{COLOR_FLAT_TEXT};"
+
+def _styler_apply_map(styler, fn, subset):
+    if hasattr(styler, "map"):
+        try: return styler.map(fn, subset=subset)
+        except Exception: pass
+    return styler.applymap(fn, subset=subset)
+
+def style_pct_columns(obj, cols):
+    if isinstance(obj, pd.DataFrame): styler, available_cols = obj.style, obj.columns
+    else: styler, available_cols = obj, obj.data.columns
+    valid_cols = [c for c in cols if c in available_cols]
+    if not valid_cols: return styler
+    return _styler_apply_map(styler, pct_bg_style, valid_cols)
+
+def fmt_change(chg, pct):
+    if chg is None or pct is None: return "—"
+    arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "●")
+    return f"{chg:+.2f} ({pct:+.2f}%) {arrow}"
+
+
+# ============================== TIMEFRAMES ==============================
+TIMEFRAMES = {
+    "3 Min":   {"interval": "1m",  "period": "5d",  "resample": "3min",  "intraday": True},
+    "5 Min":   {"interval": "5m",  "period": "5d",  "resample": None,    "intraday": True},
+    "15 Min":  {"interval": "5m",  "period": "5d",  "resample": "15min", "intraday": True},
+    "30 Min":  {"interval": "15m", "period": "1mo", "resample": "30min", "intraday": True},
+    "1 Hour":  {"interval": "60m", "period": "1mo", "resample": None,    "intraday": True},
+    "4 Hours": {"interval": "60m", "period": "3mo", "resample": "240min", "intraday": True},
+    "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
+}
+
+TF_MINUTES = {"3 Min": 3, "5 Min": 5, "15 Min": 15, "30 Min": 30, "1 Hour": 60, "4 Hours": 240, "Daily": 1440}
+
+def _build_lower_tf_map() -> Dict[str, Optional[str]]:
+    ordered = sorted(TF_MINUTES.items(), key=lambda kv: kv[1])
+    mapping: Dict[str, Optional[str]] = {}
+    for pos, (tf_name, _) in enumerate(ordered):
+        mapping[tf_name] = ordered[pos - 1][0] if pos > 0 else None
+    return mapping
+
+LOWER_TF_MAP: Dict[str, Optional[str]] = _build_lower_tf_map()
+
+
+def calc_ema_np(arr: np.ndarray, span: int) -> np.ndarray:
+    alpha = 2.0 / (span + 1.0)
+    res = np.empty_like(arr)
+    res[0] = arr[0]
+    one_minus_alpha = 1.0 - alpha
+    for i in range(1, len(arr)):
+        res[i] = alpha * arr[i] + one_minus_alpha * res[i - 1]
+    return res
+
+def check_ema_cross_generic(close: np.ndarray, fast: int = 20, slow: int = 50, label: str = ""):
+    if len(close) < slow:
+        return None
+    ema_fast = calc_ema_np(close, fast)
+    ema_slow = calc_ema_np(close, slow)
+    tag = label or f"EMA {fast}/{slow}"
+    if ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]:
+        return f"🟢 {tag} UP"
+    if ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]:
+        return f"🔴 {tag} DOWN"
+    return None
+
+def check_ema_cross_fast(close: np.ndarray):
+    return check_ema_cross_generic(close, 20, 50, "EMA20/50")
+
+def check_ema_cross_3_5(close: np.ndarray):
+    return check_ema_cross_generic(close, 3, 5, "EMA3/5")
+
+def check_volume_spike_fast(vol: np.ndarray, mult=2.0):
+    if len(vol) < 21: return None
+    avg_vol = np.mean(vol[-21:-1])
+    curr_vol = vol[-1]
+    if avg_vol > 0 and (curr_vol / avg_vol) >= mult:
+        return f"⚡ Vol {curr_vol / avg_vol:.1f}x"
+    return None
+
+def check_rsi_fast(close: np.ndarray, period=14):
+    if len(close) < period + 1: return None
+    diffs = np.diff(close)
+    gains = np.where(diffs > 0, diffs, 0.0)
+    losses = np.where(diffs < 0, -diffs, 0.0)
+    if len(gains) < period: return None
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+    if rsi >= 70: return f"🔥 RSI OB ({rsi:.0f})"
+    if rsi <= 30: return f"🧊 RSI OS ({rsi:.0f})"
+    return None
+
+def check_ds_zones(df: pd.DataFrame, symbol: str, tf_key: str,
+                    lower_tf_df: Optional[pd.DataFrame] = None, use_mtf: bool = False):
+    """🆕 अब incremental/cached scanner इस्तेमाल करता है — हर refresh पर पूरा इतिहास दोबारा scan नहीं होता।
+    Return: (signal_text, is_hq_bool, best_zone_detail_dict_or_None)"""
+    zones = scan_institutional_ds_zones_incremental(df, symbol, tf_key, lower_tf_df=lower_tf_df, use_mtf=use_mtf)
+    if not zones:
+        return None, False, None
+    current_price = df['Close'].iloc[-1]
+    active_zones = [z for z in zones if z.state in ("Fresh", "Retest")]
+
+    signals = []
+    is_hq_signal = False
+    best_zone_detail = None
+    best_priority = -1
+
+    for z in active_zones:
+        mtf_tag = "🔬MTF✓ " if (use_mtf and z.mtf_confirmed) else ""
+        retest_tag = f"(Retest#{z.touch_count}) " if z.state == "Retest" else ""
+        if z.is_demand:
+            diff_pct = (current_price - z.prox_val) / z.prox_val
+            if MIN_PROXIMITY_PCT <= diff_pct <= MAX_PROXIMITY_PCT:
+                hq_tag = "★ HQ " if z.is_hq else ""
+                if z.is_hq: is_hq_signal = True
+                signals.append(f"🟢 DEMAND ZONE ({hq_tag}{mtf_tag}{retest_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
+                priority = 2 if z.is_hq else 1
+                if priority > best_priority:
+                    best_priority = priority
+                    best_zone_detail = {"entry": z.prox_val, "sl": z.sl_val, "tp": z.tp_val, "is_demand": True, "is_hq": z.is_hq}
+        else:
+            diff_pct = (z.prox_val - current_price) / z.prox_val
+            if MIN_PROXIMITY_PCT <= diff_pct <= MAX_PROXIMITY_PCT:
+                hq_tag = "★ HQ " if z.is_hq else ""
+                if z.is_hq: is_hq_signal = True
+                signals.append(f"🔴 SUPPLY ZONE ({hq_tag}{mtf_tag}{retest_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
+                priority = 2 if z.is_hq else 1
+                if priority > best_priority:
+                    best_priority = priority
+                    best_zone_detail = {"entry": z.prox_val, "sl": z.sl_val, "tp": z.tp_val, "is_demand": False, "is_hq": z.is_hq}
+
+    if signals:
+        return " | ".join(signals), is_hq_signal, best_zone_detail
+    return None, False, None
