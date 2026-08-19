@@ -1025,12 +1025,151 @@ def fetch_nse_corporate_announcements():
         except Exception: continue
     return items
 
+# ==========================================
+# 4. AI HYPOTHESIS ENGINE (STOCK-LEVEL BUY/SELL FROM LIVE ALERTS + PCR + MACRO)
+# ==========================================
+import re as _re
+
+# Timeframe confidence weight — higher timeframe signal = more institutional weight
+TF_CONF_WEIGHT = {
+    "3 Min": 0.5, "5 Min": 0.6, "15 Min": 0.8, "30 Min": 1.0, "75 Min": 1.0,
+    "1 Hour": 1.3, "2 Hours": 1.5, "4 Hours": 1.8, "6 Hours": 2.0, "Daily": 2.5,
+}
+# Signal-quality star weight (matches the "सिग्नल" labels used in Signals/Alerts tabs)
+STARS_WEIGHT = {"🚀 HQ Zone": 3.0, "🔥 Vol Spike": 1.5, "⭐⭐ Strong": 2.0, "⭐ Signal": 1.0}
+
+
+def _extract_zone_levels(type_str: str) -> Optional[Dict[str, float]]:
+    """Pulls Entry/SL/TP numbers out of a D&S zone alert string, if present."""
+    m = _re.search(r"Entry:\s*([\d.]+),\s*SL:\s*([\d.]+),\s*TP:\s*([\d.]+)", type_str)
+    if not m:
+        return None
+    try:
+        return {"entry": float(m.group(1)), "sl": float(m.group(2)), "tp": float(m.group(3))}
+    except Exception:
+        return None
+
+
+def score_stock_alerts(alerts: list) -> Dict[str, Dict[str, Any]]:
+    """
+    Aggregates every live alert (D&S zones, EMA cross 20/50 & 3/5, Vol spike, RSI)
+    per stock/asset into a net bullish vs bearish score, with multi-timeframe
+    (MTF) confluence and signal-quality weighting baked in.
+    """
+    per_stock: Dict[str, Dict[str, Any]] = {}
+
+    for a in alerts:
+        stock = a["stock"]
+        tf = a.get("tf", "")
+        typ = a.get("type", "")
+        stars = a.get("stars", "⭐ Signal")
+        cat = a.get("category", "")
+        chart = a.get("chart", "")
+
+        rec = per_stock.setdefault(stock, {
+            "bull": 0.0, "bear": 0.0, "reasons_bull": [], "reasons_bear": [],
+            "timeframes": set(), "category": cat, "chart": chart, "zone": None,
+            "hq": False,
+        })
+        rec["timeframes"].add(tf)
+        rec["chart"] = chart
+        w = TF_CONF_WEIGHT.get(tf, 1.0) * STARS_WEIGHT.get(stars, 1.0)
+
+        for p in [x.strip() for x in typ.split("|")]:
+            pu = p.upper()
+            if "DEMAND ZONE" in pu:
+                rec["bull"] += w * 1.5
+                rec["reasons_bull"].append(f"{tf}: Demand Zone")
+                if "★ HQ" in p:
+                    rec["hq"] = True
+                zl = _extract_zone_levels(p)
+                if zl:
+                    rec["zone"] = {**zl, "side": "BUY"}
+            elif "SUPPLY ZONE" in pu:
+                rec["bear"] += w * 1.5
+                rec["reasons_bear"].append(f"{tf}: Supply Zone")
+                if "★ HQ" in p:
+                    rec["hq"] = True
+                zl = _extract_zone_levels(p)
+                if zl:
+                    rec["zone"] = {**zl, "side": "SELL"}
+            elif "EMA20/50 UP" in pu:
+                rec["bull"] += w
+                rec["reasons_bull"].append(f"{tf}: EMA20/50 बुलिश क्रॉस")
+            elif "EMA20/50 DOWN" in pu:
+                rec["bear"] += w
+                rec["reasons_bear"].append(f"{tf}: EMA20/50 बेयरिश क्रॉस")
+            elif "EMA3/5 UP" in pu:
+                rec["bull"] += w * 0.6
+                rec["reasons_bull"].append(f"{tf}: EMA3/5 मोमेंटम अप")
+            elif "EMA3/5 DOWN" in pu:
+                rec["bear"] += w * 0.6
+                rec["reasons_bear"].append(f"{tf}: EMA3/5 मोमेंटम डाउन")
+            elif "RSI OS" in pu:
+                rec["bull"] += w * 0.7
+                rec["reasons_bull"].append(f"{tf}: RSI Oversold (रिवर्सल संभावना)")
+            elif "RSI OB" in pu:
+                rec["bear"] += w * 0.7
+                rec["reasons_bear"].append(f"{tf}: RSI Overbought (करेक्शन संभावना)")
+            elif "VOL" in pu and "X" in pu:
+                # A volume spike is directionless on its own — it just confirms
+                # whichever side already dominates that timeframe's signal mix.
+                if rec["bull"] >= rec["bear"]:
+                    rec["bull"] += w * 0.4
+                    rec["reasons_bull"].append(f"{tf}: Volume Spike (कन्फर्मेशन)")
+                else:
+                    rec["bear"] += w * 0.4
+                    rec["reasons_bear"].append(f"{tf}: Volume Spike (कन्फर्मेशन)")
+
+    return per_stock
+
+
+def build_ai_hypothesis(alerts: list, pcr_value: Optional[float], top_n: int = 5
+                         ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Combines per-stock alert scoring (D&S Zones + EMA + Volume + RSI, weighted by
+    timeframe & signal quality) with the broader Nifty PCR/OI tilt to rank
+    High-Probability BUY-side and SELL-side hypothesis candidates.
+    """
+    per_stock = score_stock_alerts(alerts)
+
+    market_tilt = 0.0
+    if pcr_value is not None:
+        if pcr_value > 1.1:
+            market_tilt = 0.3   # heavy put-writing -> broad bullish tilt
+        elif pcr_value < 0.8:
+            market_tilt = -0.3  # heavy call-writing -> broad bearish tilt
+
+    buy_list, sell_list = [], []
+    for stock, rec in per_stock.items():
+        net = rec["bull"] - rec["bear"] + market_tilt
+        confluence = len(rec["timeframes"])
+        confidence = round(min(99, (abs(net) * 12) + confluence * 6 + (15 if rec["hq"] else 0)), 0)
+
+        entry = {
+            "Stock": stock, "Category": rec["category"], "Net Score": round(net, 2),
+            "Confidence %": confidence, "MTF Confluence": confluence,
+            "HQ Zone": "✅" if rec["hq"] else "—",
+            "Reasons": rec["reasons_bull"] if net > 0 else rec["reasons_bear"],
+            "Zone": rec["zone"], "Chart": rec["chart"],
+        }
+        if net > 0.3:
+            buy_list.append(entry)
+        elif net < -0.3:
+            sell_list.append(entry)
+
+    buy_list.sort(key=lambda x: x["Net Score"], reverse=True)
+    sell_list.sort(key=lambda x: x["Net Score"])
+
+    return buy_list[:top_n], sell_list[:top_n]
+
+
 # ============================== TABS ORDER ==============================
 # Signals, Alerts, Global, News: AUTO-REFRESH ALWAYS ACTIVE
 # Sector, Watchlist, Calendar, FII/DII, Delivery, Gainers/Losers: DEFERRED EXECUTION ON TOUCH
-(tab_signals, tab_alerts, tab_global, tab_news, tab_sector, tab_stocks,
+(tab_signals, tab_alerts, tab_hypothesis, tab_global, tab_news, tab_sector, tab_stocks,
  tab_calendar, tab_fii, tab_delivery, tab_movers) = st.tabs([
-    "📊 Signals", "🔔 Alerts", "🌍 Global", "📰 News & AI Hypothesis",
+    "📊 Signals", "🔔 Alerts", "🎯 Buy/Sell Hypothesis", "🌍 Global", "📰 News & AI Hypothesis",
     "🏭 Sector Impact", "📋 Watchlist", "🗓️ Calendar", "💰 FII/DII+Nifty",
     "📦 Delivery%+Deals", "🏆 Gainers/Losers"
 ])
@@ -1206,6 +1345,106 @@ with tab_alerts:
         if st.button("🗑️ सभी Alerts अभी साफ करें"):
             st.session_state.alerts = []
             st.rerun()
+
+# ---------- TAB 2b: HIGH-PROBABILITY AI BUY/SELL HYPOTHESIS (DEFERRED LOAD ON TOUCH) ----------
+with tab_hypothesis:
+    st.subheader("🎯 High-Probability AI Hypothesis — BUY साइड बनाम SELL साइड")
+    st.caption(
+        "📊 Signals टैब में जमा हुए सभी Live Alerts (D&S Zones, EMA 20/50, EMA 3/5, Volume Spike, RSI) "
+        "को Multi-Timeframe Confluence + Signal Quality के हिसाब से वेट कर, Nifty Option PCR/OI और "
+        "ग्लोबल मैक्रो सेंटीमेंट के साथ कॉम्बाइन किया गया है। यह ट्रेड सलाह नहीं है — केवल डेटा-ड्रिवन हाइपोथिसिस है, "
+        "एंट्री लेने से पहले अपनी रिसर्च और रिस्क मैनेजमेंट ज़रूर करें।"
+    )
+
+    if st.button("▶️ AI Hypothesis बनाएं (Signals + PCR + Global Macro Analyze करें)", key="btn_hypothesis"):
+        if not st.session_state.alerts:
+            st.warning("अभी कोई Live Alert मौजूद नहीं है। पहले 📊 Signals टैब खोलें ताकि Alerts जनरेट हों, फिर यहां वापस आकर हाइपोथिसिस बनाएं।")
+        else:
+            with st.spinner("⚡ Nifty PCR/OI, Global Macro Cues और सभी Live Alerts को कॉम्बाइन कर हाइपोथिसिस तैयार हो रहा है..."):
+                # 1. Nifty Option Chain -> PCR + Support/Resistance strikes
+                oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+                pcr_value, max_call_oi_strike, max_put_oi_strike = None, None, None
+                if oc_data:
+                    try:
+                        records = oc_data["records"]["data"]
+                        total_call_oi = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
+                        total_put_oi = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
+                        if total_call_oi > 0:
+                            pcr_value = round(total_put_oi / total_call_oi, 2)
+                        call_oi_map = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
+                        put_oi_map = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
+                        if call_oi_map:
+                            max_call_oi_strike = max(call_oi_map, key=call_oi_map.get)
+                        if put_oi_map:
+                            max_put_oi_strike = max(put_oi_map, key=put_oi_map.get)
+                    except Exception:
+                        pass
+
+                # 2. Global Macro Cues (reuses cached quotes engine — no duplicate network cost)
+                macro_symbols = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
+                macro_quotes = get_quotes(macro_symbols)
+                sp500_pct = macro_quotes.get("^GSPC", {}).get("pct", 0)
+                crude_pct = macro_quotes.get("CL=F", {}).get("pct", 0)
+                dxy_pct = macro_quotes.get("DX-Y.NYB", {}).get("pct", 0)
+
+                if sp500_pct > 0.3 and crude_pct < 0:
+                    macro_bias_text = "🟢 ग्लोबल सेंटीमेंट BUY-साइड के पक्ष में झुका हुआ है (US बुलिश + Crude नरम)"
+                elif sp500_pct < -0.3 or dxy_pct > 0.3:
+                    macro_bias_text = "🔴 ग्लोबल सेंटीमेंट SELL-साइड के पक्ष में झुका हुआ है (US कमज़ोर / डॉलर मज़बूत)"
+                else:
+                    macro_bias_text = "🟡 ग्लोबल सेंटीमेंट न्यूट्रल है — कोई स्ट्रॉन्ग मैक्रो बायस नहीं"
+
+                # 3. Combine everything -> ranked BUY/SELL hypothesis lists
+                buy_list, sell_list = build_ai_hypothesis(st.session_state.alerts, pcr_value, top_n=5)
+
+            # ---- Market Context Banner ----
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Nifty PCR (OI)", pcr_value if pcr_value is not None else "—")
+            c2.metric("S&P500", f"{sp500_pct:+.2f}%")
+            c3.metric("Crude Oil", f"{crude_pct:+.2f}%")
+            c4.metric("DXY", f"{dxy_pct:+.2f}%")
+            st.info(f"{macro_bias_text} · Demand Support ~{max_put_oi_strike or 'N/A'} · Supply Resistance ~{max_call_oi_strike or 'N/A'}")
+
+            st.markdown("---")
+
+            def render_hypothesis_side(title, items, side_bg):
+                st.markdown(f"### {title}")
+                if not items:
+                    st.caption("अभी इस साइड के लिए कोई हाई-प्रोबेबिलिटी उम्मीदवार नहीं मिला — या तो अलर्ट्स कम हैं या सिग्नल मिक्स-न्यूट्रल है।")
+                    return
+                for it in items:
+                    zone = it["Zone"]
+                    zone_txt = ""
+                    if zone:
+                        zone_txt = f" · <b>Entry:</b> {zone['entry']:.2f} · <b>SL:</b> {zone['sl']:.2f} · <b>TP:</b> {zone['tp']:.2f}"
+                    reasons_txt = " • ".join(it["Reasons"][:4]) if it["Reasons"] else "General Multi-Signal Confluence"
+                    hq_txt = " · 🚀 HQ Zone" if it["HQ Zone"] == "✅" else ""
+                    st.markdown(
+                        f"""
+                        <div style="background-color:{side_bg}; border-radius:10px; padding:12px 16px; margin-bottom:10px; border:1px solid #e0e0e0;">
+                            <b style="font-size:15px;">{it['Stock']}</b> &nbsp;
+                            <span style="font-size:12px; color:#555;">({it['Category']})</span>
+                            <span style="float:right; font-weight:bold;">Confidence: {it['Confidence %']:.0f}%{hq_txt}</span>
+                            <br><span style="font-size:13px;">Net Score: {it['Net Score']} · MTF Confluence: {it['MTF Confluence']} टाइमफ्रेम{zone_txt}</span>
+                            <br><span style="font-size:12.5px; color:#333;">📌 {reasons_txt}</span>
+                            <br><a href="{it['Chart']}" target="_blank" style="font-size:12.5px;">📈 Chart देखें</a>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            col_buy, col_sell = st.columns(2)
+            with col_buy:
+                render_hypothesis_side("🟢 High-Probability BUY साइड", buy_list, "#e6f4ea")
+            with col_sell:
+                render_hypothesis_side("🔴 High-Probability SELL साइड", sell_list, "#fce8e6")
+
+            st.caption(
+                "⚠️ यह हाइपोथिसिस पूरी तरह ऑटोमेटेड सिग्नल कॉम्बिनेशन (D&S Zones + EMA + Volume + RSI + Nifty PCR + "
+                "Global Macro Cues) पर आधारित है — निवेश सलाह नहीं है। एंट्री से पहले करेंट न्यूज़/इवेंट्स खुद वेरीफाई करें।"
+            )
+    else:
+        st.info("💡 📊 Signals टैब में कुछ Alerts जनरेट होने के बाद, ऊपर **▶️ AI Hypothesis बनाएं** बटन पर क्लिक करें ताकि हाई-प्रोबेबिलिटी Buy/Sell साइड यहां दिखे।")
 
 # ---------- TAB 3: GLOBAL MARKETS (AUTO-REFRESH) ----------
 with tab_global:
