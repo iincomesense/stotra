@@ -6,6 +6,20 @@ Watchlist with live-flash news | Institutional D&S Zones / EMA / Volume / RSI Si
 Economic Calendar | FII/DII (Analysis-driven) + Nifty Option-OI |
 Delivery% (2-day compare) + Bulk/Block Deals | Gainers/Losers |
 Institutional-style News & Opening Hypothesis Engine.
+
+REFINED INSTITUTIONAL D&S ENGINE v2
+------------------------------------
+- Leg-In candle: strong directional close (>=70% of range) + volume/TR filters
+- Base candles: small body (indecision), tight range, volume contraction,
+  and price-overlap between consecutive base candles (limit-order cluster proxy)
+- Leg-Out candle: explosive TR, wick-clean, and a volume CLIMAX vs 20-bar avg
+  (not just vs leg-in volume) — proof that resting orders actually triggered
+- Zone stays "Fresh"/"Retest" (still actionable) until price fully consumes
+  (fills) the base candle range — a single wick touch does NOT invalidate it
+- Optional Multi-Timeframe (MTF) No-Break Validation: re-checks the leg-in -> 
+  leg-out impulse on the next-lower timeframe to confirm price never broke
+  back through the zone's far boundary mid-formation (i.e. the move was
+  genuinely explosive even at half timeframe, not a higher-TF illusion)
 """
 
 import concurrent.futures
@@ -35,7 +49,7 @@ except ImportError:
 import streamlit.components.v1 as components
 
 # ==========================================
-# 1. INSTITUTIONAL D&S CONFIGURATION (UNCHANGED)
+# 1. INSTITUTIONAL D&S CONFIGURATION
 # ==========================================
 TARGET_RR = 5.0
 SL_BUFFER_ATR = 0.1
@@ -53,6 +67,17 @@ REQ_LEG_IN_VOL = True
 MIN_PROXIMITY_PCT = 0.005  # 0.5%
 MAX_PROXIMITY_PCT = 0.010  # 1.0%
 
+# ---- REFINED "Limit-Order-Resting-Probability" rules for base candles ----
+LEG_IN_STRONG_CLOSE_PCT = 0.70   # leg-in candle close must be in top/bottom 70% of its range
+BASE_MAX_BODY_RATIO     = 0.35   # base candle body <= 35% of its own range (indecision candle)
+BASE_MIN_OVERLAP_PCT    = 0.50   # consecutive base candles must overlap >=50% (price cluster)
+BASE_VOL_MAX_RATIO      = 1.0    # avg base volume <= leg-in volume (activity should dry up)
+LEG_OUT_VOL_LOOKBACK    = 20
+LEG_OUT_VOL_MULT        = 1.5    # leg-out volume >= 1.5x of last 20-bar avg volume (climax)
+
+# ---- Optional Multi-Timeframe (MTF) No-Break Validation ----
+MTF_BUFFER_ATR_MULT     = 0.15   # small ATR-based tolerance so tiny lower-TF wicks don't reject a valid zone
+
 # ==========================================
 # 2. VECTORIZED NUMPY CALCULATIONS (PURE C-SPEED)
 # ==========================================
@@ -63,7 +88,7 @@ def calculate_atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, perio
         return np.zeros(n)
     tr = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
     tr = np.insert(tr, 0, high[0] - low[0])
-    
+
     atr = np.empty(n, dtype=np.float64)
     atr[0] = tr[0]
     alpha = 1.0 / period
@@ -77,20 +102,96 @@ def calculate_pivots_np(highs: np.ndarray, lows: np.ndarray, left: int = 5, righ
     n = len(highs)
     pivot_highs = np.full(n, np.nan)
     pivot_lows = np.full(n, np.nan)
-    
+
     for i in range(left, n - right):
         window_highs = highs[i - left : i + right + 1]
         if highs[i] == np.max(window_highs) and np.sum(window_highs == highs[i]) == 1:
             pivot_highs[i] = highs[i]
-            
+
         window_lows = lows[i - left : i + right + 1]
         if lows[i] == np.min(window_lows) and np.sum(window_lows == lows[i]) == 1:
             pivot_lows[i] = lows[i]
-            
+
     return pivot_highs, pivot_lows
 
+
+# ==========================================
+# 2b. REFINED BASE-CANDLE / LEG QUALITY HELPERS
+# ==========================================
+def _leg_in_strong_close_ok(open_v: float, high_v: float, low_v: float, close_v: float, is_bull: bool) -> bool:
+    """Leg-in candle must close strongly in its own directional extreme —
+    proof of directional intent, not a random/noise bar."""
+    rng = high_v - low_v
+    if rng <= 0:
+        return False
+    if is_bull:
+        return ((close_v - low_v) / rng) >= LEG_IN_STRONG_CLOSE_PCT
+    else:
+        return ((high_v - close_v) / rng) >= LEG_IN_STRONG_CLOSE_PCT
+
+def _base_body_ratio_ok(o_arr: np.ndarray, h_arr: np.ndarray, l_arr: np.ndarray, c_arr: np.ndarray) -> bool:
+    """Every base candle must be a small-body / indecision candle — this is the
+    footprint of resting limit orders absorbing supply/demand quietly."""
+    rng = h_arr - l_arr
+    body = np.abs(c_arr - o_arr)
+    safe_rng = np.where(rng == 0, 1e-9, rng)
+    ratios = body / safe_rng
+    return bool(np.all(np.where(rng == 0, 0.0, ratios) <= BASE_MAX_BODY_RATIO))
+
+def _base_overlap_ok(base_high_arr: np.ndarray, base_low_arr: np.ndarray) -> bool:
+    """Consecutive base candles should overlap heavily — price staying in one
+    tight cluster (where big players can accumulate orders), not drifting."""
+    if len(base_high_arr) < 2:
+        return True
+    for k in range(1, len(base_high_arr)):
+        h1, l1 = base_high_arr[k-1], base_low_arr[k-1]
+        h2, l2 = base_high_arr[k], base_low_arr[k]
+        overlap = min(h1, h2) - max(l1, l2)
+        min_rng = min(h1 - l1, h2 - l2)
+        if min_rng <= 0 or (overlap / min_rng) < BASE_MIN_OVERLAP_PCT:
+            return False
+    return True
+
+def validate_mtf_no_break(lower_df: Optional[pd.DataFrame], leg_in_time, leg_out_time,
+                           boundary_val: float, is_demand: bool, atr_val: float,
+                           buffer_mult: float = MTF_BUFFER_ATR_MULT) -> bool:
+    """
+    OPTIONAL Multi-Timeframe (MTF) No-Break Validation.
+
+    Re-examines the leg-in -> leg-out impulse window on the NEXT-LOWER
+    timeframe. Confirms price never traded back through the zone's far
+    boundary (the base/leg-in far edge) while the impulse was forming.
+    This proves the explosive move holds up even when you "zoom in" to half
+    timeframe — i.e. genuine institutional aggression, not a higher-TF
+    candle-compression illusion.
+
+    Fails OPEN (returns True) when lower-TF data isn't available/alignable,
+    so a missing lower-TF fetch never silently kills otherwise-valid zones —
+    it simply skips the extra confirmation for that instance.
+    """
+    if lower_df is None or lower_df.empty:
+        return True
+    try:
+        window = lower_df[(lower_df.index >= leg_in_time) & (lower_df.index <= leg_out_time)]
+    except Exception:
+        return True
+
+    if window.empty or len(window) < 2:
+        return True
+
+    buffer = buffer_mult * atr_val if atr_val > 0 else 0.0
+
+    if is_demand:
+        min_low = float(window['Low'].min())
+        return min_low >= (boundary_val - buffer)
+    else:
+        max_high = float(window['High'].max())
+        return max_high <= (boundary_val + buffer)
+
+
 class Zone:
-    def __init__(self, prox_val, dist_val, sl_val, tp_val, is_demand, is_hq, density_score, start_idx):
+    def __init__(self, prox_val, dist_val, sl_val, tp_val, is_demand, is_hq, density_score,
+                 start_idx, mtf_confirmed: bool = True):
         self.prox_val = prox_val
         self.dist_val = dist_val
         self.sl_val = sl_val
@@ -98,11 +199,19 @@ class Zone:
         self.is_demand = is_demand
         self.is_hq = is_hq
         self.density_score = density_score
-        self.state = "Fresh"  # Fresh -> Tested -> Broken
+        # Fresh  -> zone untouched, fully actionable
+        # Retest -> price wicked into prox_val but did NOT fully fill the base
+        #           (still actionable per user rule: only a FULL fill kills a zone)
+        # Filled -> price traded all the way through to dist_val — zone is dead
+        self.state = "Fresh"
+        self.touch_count = 0
+        self.mtf_confirmed = mtf_confirmed
         self.start_idx = start_idx
 
-def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
-    """Pine Script Version 6 D&S Engine — High-Speed NumPy Vectorized Edition"""
+
+def scan_institutional_ds_zones(df: pd.DataFrame, lower_tf_df: Optional[pd.DataFrame] = None,
+                                 use_mtf: bool = False) -> List[Zone]:
+    """Pine Script Version 6 D&S Engine — High-Speed NumPy Vectorized Edition (Refined v2)"""
     if df is None or len(df) < 30:
         return []
 
@@ -112,105 +221,149 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
     close = df['Close'].to_numpy(dtype=np.float64)
     open_p = df['Open'].to_numpy(dtype=np.float64)
     volume = df['Volume'].to_numpy(dtype=np.float64)
+    idx = df.index
     n = len(high)
 
     atr = calculate_atr_np(high, low, close, ATR_PERIOD)
     pivot_h, pivot_l = calculate_pivots_np(high, low, 5, 5)
-    
+
     tr = high - low
     is_bull = close > open_p
     is_bear = open_p > close
-    
+
     body_max = np.maximum(open_p, close)
     body_min = np.minimum(open_p, close)
     wicks = (high - body_max) + (body_min - low)
     wick_pct = np.where(tr == 0, 0.0, wicks / tr)
-    
+
     all_zones: List[Zone] = []
     last_swing_high = np.nan
     last_swing_low = np.nan
-    
+
     for i in range(15, n):
         if not np.isnan(pivot_h[i]):
             last_swing_high = pivot_h[i]
         if not np.isnan(pivot_l[i]):
             last_swing_low = pivot_l[i]
-            
+
         zone_found = False
-        
+
         for base_count in range(MIN_BASE_COUNT, MAX_BASE_COUNT + 1):
             if zone_found:
                 break
-                
+
             leg_out_idx = i
             leg_in_idx = i - base_count - 1
-            
+
             if leg_in_idx < 0:
                 continue
-                
+
             leg_out_tr = tr[leg_out_idx]
             leg_in_tr = tr[leg_in_idx]
             leg_out_atr = atr[leg_out_idx]
             leg_in_atr = atr[leg_in_idx]
-            
+
             valid_leg_in = True
             if REQ_LEG_IN_VOL:
                 valid_leg_in = (volume[leg_in_idx] >= volume[leg_in_idx - 1] * 0.8) and \
                                (leg_in_tr >= 0.8 * leg_in_atr)
-                               
+
             passes_volume = volume[leg_out_idx] > volume[leg_in_idx]
             is_leg_out_explosive = leg_out_tr >= (LEG_OUT_ATR_MULT * leg_out_atr)
             is_leg_out_wick_valid = wick_pct[leg_out_idx] <= MAX_WICK_PCT
-            
+
             is_demand_leg_out = is_bull[leg_out_idx]
             is_supply_leg_out = is_bear[leg_out_idx]
-            
+
+            base_open_slice = open_p[leg_in_idx + 1 : leg_out_idx]
+            base_close_slice = close[leg_in_idx + 1 : leg_out_idx]
             base_tr_slice = tr[leg_in_idx + 1 : leg_out_idx]
             base_atr_slice = atr[leg_in_idx + 1 : leg_out_idx]
             base_high_slice = high[leg_in_idx + 1 : leg_out_idx]
             base_low_slice = low[leg_in_idx + 1 : leg_out_idx]
+            base_vol_slice = volume[leg_in_idx + 1 : leg_out_idx]
 
             max_base_tr = np.max(base_tr_slice)
             max_base_high = np.max(base_high_slice)
             min_base_low = np.min(base_low_slice)
 
             all_base_valid = np.all(base_tr_slice <= (MAX_BASE_ATR_MULT * base_atr_slice))
-                    
+
+            # ---- REFINED: base body ratio (indecision / resting-order footprint) ----
+            body_ratio_ok = _base_body_ratio_ok(base_open_slice, base_high_slice, base_low_slice, base_close_slice)
+
+            # ---- REFINED: base volume contraction (orders quietly accumulating) ----
+            base_vol_ok = True
+            if len(base_vol_slice) > 0:
+                base_vol_ok = np.mean(base_vol_slice) <= (BASE_VOL_MAX_RATIO * volume[leg_in_idx])
+
+            # ---- REFINED: base overlap (limit-order price cluster, not a drift) ----
+            overlap_ok = _base_overlap_ok(base_high_slice, base_low_slice)
+
+            # ---- REFINED: leg-in strong directional close ----
+            leg_in_strong_close_ok = _leg_in_strong_close_ok(
+                open_p[leg_in_idx], high[leg_in_idx], low[leg_in_idx], close[leg_in_idx], is_bull[leg_in_idx]
+            )
+
+            # ---- REFINED: leg-out volume CLIMAX vs 20-bar average (not just vs leg-in) ----
+            lookback_start = max(0, leg_out_idx - LEG_OUT_VOL_LOOKBACK)
+            avg_vol_20 = np.mean(volume[lookback_start:leg_out_idx]) if leg_out_idx > lookback_start else 0.0
+            passes_leg_out_vol_climax = avg_vol_20 > 0 and (volume[leg_out_idx] >= LEG_OUT_VOL_MULT * avg_vol_20)
+
             passes_tr_hierarchy = (leg_out_tr > leg_in_tr) and (leg_in_tr > max_base_tr)
-            
+
             is_rbr = is_bull[leg_in_idx] and is_demand_leg_out
             is_dbr = is_bear[leg_in_idx] and is_demand_leg_out
             is_dbd = is_bear[leg_in_idx] and is_supply_leg_out
             is_rbd = is_bull[leg_in_idx] and is_supply_leg_out
-            
+
             has_bos = False
             if is_demand_leg_out:
                 has_bos = close[leg_out_idx] > max(high[leg_in_idx], max_base_high)
             elif is_supply_leg_out:
                 has_bos = close[leg_out_idx] < min(low[leg_in_idx], min_base_low)
-                
+
             has_imbalance = True
             if USE_IMBALANCE:
                 if is_demand_leg_out:
                     has_imbalance = (low[leg_out_idx] > max_base_high) or (close[leg_out_idx] > high[leg_in_idx])
                 elif is_supply_leg_out:
                     has_imbalance = (high[leg_out_idx] < min_base_low) or (close[leg_out_idx] < low[leg_in_idx])
-                    
+
             swept_liquidity = False
             if is_demand_leg_out and not np.isnan(last_swing_low):
                 swept_liquidity = (min_base_low < last_swing_low) or (low[leg_in_idx] < last_swing_low)
             elif is_supply_leg_out and not np.isnan(last_swing_high):
                 swept_liquidity = (max_base_high > last_swing_high) or (high[leg_in_idx] > last_swing_high)
-                
+
             passes_sweep_check = swept_liquidity if USE_SWEEP_FILTER else True
-            
+
+            # prox_val / dist_val computed early so the optional MTF check can use dist_val
+            prox_val = max_base_high if is_demand_leg_out else min_base_low
+            dist_val = min_base_low if is_demand_leg_out else max_base_high
+
+            # ---- OPTIONAL: Multi-Timeframe No-Break Validation ----
+            mtf_ok = True
+            if use_mtf and lower_tf_df is not None:
+                try:
+                    leg_in_time = idx[leg_in_idx]
+                    end_pos = leg_out_idx + 1 if (leg_out_idx + 1) < n else leg_out_idx
+                    leg_out_time = idx[end_pos]
+                    mtf_ok = validate_mtf_no_break(
+                        lower_tf_df, leg_in_time, leg_out_time, dist_val, is_demand_leg_out, leg_out_atr
+                    )
+                except Exception:
+                    mtf_ok = True
+
             is_valid = (is_rbr or is_dbr or is_dbd or is_rbd) and all_base_valid and valid_leg_in and \
                        is_leg_out_explosive and is_leg_out_wick_valid and passes_tr_hierarchy and \
-                       has_bos and passes_volume and has_imbalance and passes_sweep_check
-                       
+                       has_bos and passes_volume and has_imbalance and passes_sweep_check and \
+                       body_ratio_ok and base_vol_ok and overlap_ok and leg_in_strong_close_ok and \
+                       passes_leg_out_vol_climax and mtf_ok
+
             if is_valid:
                 zone_found = True
-                
+
                 density_score = 25
                 if leg_out_tr >= HQ_LEG_OUT_ATR * leg_out_atr:
                     density_score += 25
@@ -218,48 +371,48 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
                     density_score += 25
                 if base_count <= 2 and max_base_tr <= 0.7 * atr[i-1]:
                     density_score += 25
-                    
+
                 is_hq = density_score >= 75
-                
-                prox_val = max_base_high if is_demand_leg_out else min_base_low
-                dist_val = min_base_low if is_demand_leg_out else max_base_high
-                
-                curr_atr = atr[i]
+
+                curr_atr = leg_out_atr  # leg_out_idx == i, so atr[i] == leg_out_atr
                 sl_val = (dist_val - (SL_BUFFER_ATR * curr_atr)) if is_demand_leg_out else (dist_val + (SL_BUFFER_ATR * curr_atr))
                 risk_per_share = abs(prox_val - sl_val)
                 tp_val = (prox_val + (risk_per_share * TARGET_RR)) if is_demand_leg_out else (prox_val - (risk_per_share * TARGET_RR))
-                
+
                 is_duplicate = False
                 for existing in all_zones[-10:]:
                     if existing.is_demand == is_demand_leg_out and abs(existing.prox_val - prox_val) < (curr_atr * 0.25):
                         is_duplicate = True
                         break
-                        
+
                 if not is_duplicate:
-                    all_zones.append(Zone(prox_val, dist_val, sl_val, tp_val, is_demand_leg_out, is_hq, density_score, i))
-                    
+                    all_zones.append(Zone(prox_val, dist_val, sl_val, tp_val, is_demand_leg_out, is_hq,
+                                           density_score, i, mtf_confirmed=mtf_ok))
+
         curr_high = high[i]
         curr_low = low[i]
-        
+
+        # ---- STATE MACHINE: Fresh -> Retest -> Filled ----
+        # A zone stays actionable (Fresh/Retest) until price FULLY fills the
+        # base range (reaches dist_val). A wick-only touch of prox_val just
+        # marks it as "Retest" — still tradeable, not invalidated.
         for z in all_zones:
-            if z.state == "Broken":
+            if z.state == "Filled":
                 continue
-                
-            if z.state == "Fresh":
-                if z.is_demand:
-                    if curr_low <= z.prox_val and curr_low > z.dist_val:
-                        z.state = "Tested"
-                    elif curr_low <= z.dist_val:
-                        z.state = "Broken"
-                else:
-                    if curr_high >= z.prox_val and curr_high < z.dist_val:
-                        z.state = "Tested"
-                    elif curr_high >= z.dist_val:
-                        z.state = "Broken"
-            elif z.state == "Tested":
-                if (z.is_demand and curr_low <= z.dist_val) or (not z.is_demand and curr_high >= z.dist_val):
-                    z.state = "Broken"
-                    
+
+            if z.is_demand:
+                touched = curr_low <= z.prox_val
+                fully_filled = curr_low <= z.dist_val
+            else:
+                touched = curr_high >= z.prox_val
+                fully_filled = curr_high >= z.dist_val
+
+            if fully_filled:
+                z.state = "Filled"
+            elif touched:
+                z.touch_count += 1
+                z.state = "Retest"
+
     return all_zones
 
 
@@ -269,14 +422,14 @@ def scan_institutional_ds_zones(df: pd.DataFrame) -> List[Zone]:
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
-ALERT_CLEAR_HOUR_IST = 20          
-NEWS_WINDOW_START = dtime(8, 30)   
-NEWS_WINDOW_END = dtime(20, 30)    
+ALERT_CLEAR_HOUR_IST = 20
+NEWS_WINDOW_START = dtime(8, 30)
+NEWS_WINDOW_END = dtime(20, 30)
 
 COLOR_POS_BG, COLOR_POS_TEXT = "#d4f8d4", "#0a7d2f"
 COLOR_NEG_BG, COLOR_NEG_TEXT = "#f8f8d4", "#c0392b"
 COLOR_FLAT_TEXT = "#555555"
-COLOR_SPIKE_BG = "#ffe1a8"   
+COLOR_SPIKE_BG = "#ffe1a8"
 
 RAW_STOCKS = """TCS,M&M,HCLTECH,SBIN,INFY,HINDUNILVR,RELIANCE,BHARTIARTL,BEL,ONGC,
 BAJAJ_AUTO,NESTLEIND,POWERGRID,ULTRACEMCO,ITC,ADANIPORTS,LT,COALINDIA,ADANIENT,
@@ -458,6 +611,25 @@ TIMEFRAMES = {
     "Daily":   {"interval": "1d",  "period": "6mo", "resample": None,     "intraday": False},
 }
 
+# Approximate real duration (minutes) of each timeframe — used only to derive
+# the "next lower timeframe" mapping for the optional MTF validation below.
+TF_MINUTES = {
+    "3 Min": 3, "5 Min": 5, "15 Min": 15, "30 Min": 30,
+    "1 Hour": 60, "75 Min": 75, "2 Hours": 120, "4 Hours": 240,
+    "6 Hours": 360, "Daily": 1440,
+}
+
+def _build_lower_tf_map() -> Dict[str, Optional[str]]:
+    ordered = sorted(TF_MINUTES.items(), key=lambda kv: kv[1])  # ascending by minutes
+    mapping: Dict[str, Optional[str]] = {}
+    for pos, (tf_name, _) in enumerate(ordered):
+        mapping[tf_name] = ordered[pos - 1][0] if pos > 0 else None
+    return mapping
+
+# e.g. "2 Hours" -> "1 Hour", "1 Hour" -> "30 Min", "3 Min" -> None (already lowest)
+LOWER_TF_MAP: Dict[str, Optional[str]] = _build_lower_tf_map()
+
+
 def calc_ema_np(arr: np.ndarray, span: int) -> np.ndarray:
     """Reusable NumPy EMA calculator (extracted so 20/50 AND 3/5 can share it)."""
     alpha = 2.0 / (span + 1.0)
@@ -506,45 +678,50 @@ def check_rsi_fast(close: np.ndarray, period=14):
     diffs = np.diff(close)
     gains = np.where(diffs > 0, diffs, 0.0)
     losses = np.where(diffs < 0, -diffs, 0.0)
-    
+
     if len(gains) < period: return None
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
-    
+
     if avg_loss == 0:
         rsi = 100.0
     else:
         rs = avg_gain / avg_loss
         rsi = 100.0 - (100.0 / (1.0 + rs))
-        
+
     if rsi >= 70: return f"🔥 RSI OB ({rsi:.0f})"
     if rsi <= 30: return f"🧊 RSI OS ({rsi:.0f})"
     return None
 
-def check_ds_zones(df: pd.DataFrame):
-    """Institutional Demand & Supply Proximity Alert Check"""
-    zones = scan_institutional_ds_zones(df)
+def check_ds_zones(df: pd.DataFrame, lower_tf_df: Optional[pd.DataFrame] = None, use_mtf: bool = False):
+    """Institutional Demand & Supply Proximity Alert Check.
+    A zone remains actionable in BOTH the 'Fresh' and 'Retest' states — per the
+    rule that only a FULL fill of the base range invalidates a zone, not a
+    single wick touch."""
+    zones = scan_institutional_ds_zones(df, lower_tf_df=lower_tf_df, use_mtf=use_mtf)
     if not zones:
         return None, False
     current_price = df['Close'].iloc[-1]
-    fresh_zones = [z for z in zones if z.state == "Fresh"]
-    
+    active_zones = [z for z in zones if z.state in ("Fresh", "Retest")]
+
     signals = []
     is_hq_signal = False
-    for z in fresh_zones:
+    for z in active_zones:
+        mtf_tag = "🔬MTF✓ " if (use_mtf and z.mtf_confirmed) else ""
+        retest_tag = f"(Retest#{z.touch_count}) " if z.state == "Retest" else ""
         if z.is_demand:
             diff_pct = (current_price - z.prox_val) / z.prox_val
             if MIN_PROXIMITY_PCT <= diff_pct <= MAX_PROXIMITY_PCT:
                 hq_tag = "★ HQ " if z.is_hq else ""
                 if z.is_hq: is_hq_signal = True
-                signals.append(f"🟢 DEMAND ZONE ({hq_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
+                signals.append(f"🟢 DEMAND ZONE ({hq_tag}{mtf_tag}{retest_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
         else:
             diff_pct = (z.prox_val - current_price) / z.prox_val
             if MIN_PROXIMITY_PCT <= diff_pct <= MAX_PROXIMITY_PCT:
                 hq_tag = "★ HQ " if z.is_hq else ""
                 if z.is_hq: is_hq_signal = True
-                signals.append(f"🔴 SUPPLY ZONE ({hq_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
-                
+                signals.append(f"🔴 SUPPLY ZONE ({hq_tag}{mtf_tag}{retest_tag}Entry: {z.prox_val:.2f}, SL: {z.sl_val:.2f}, TP: {z.tp_val:.2f}, {diff_pct*100:.2f}% away)")
+
     if signals:
         return " | ".join(signals), is_hq_signal
     return None, False
@@ -573,7 +750,7 @@ scan_scope = st.sidebar.multiselect(
 )
 
 tf_options = ["ALL"] + list(TIMEFRAMES.keys())
-selected_tf_raw = st.sidebar.multiselect("Signal Scan Timeframes", tf_options, default=["1 Hour", "Daily"])
+selected_tf_raw = st.sidebar.multiselect("Signal Scan Timeframes", tf_options, default=["3 Min", "5 Min", "1 Hour", "Daily"])
 
 if "ALL" in selected_tf_raw:
     signal_timeframes = list(TIMEFRAMES.keys())
@@ -587,6 +764,20 @@ selected_indicators = st.sidebar.multiselect(
 )
 
 vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔬 High-Validation D&S Filters (Optional)")
+use_mtf_validation = st.sidebar.checkbox(
+    "Multi-Timeframe No-Break Validation (सख्त)",
+    value=False,
+    help=("जब ON हो: हर D&S zone को उसके अगले-नीचे टाइमफ्रेम पर दोबारा जांचा जाता है — "
+          "leg-in से leg-out तक के बीच price zone की far-boundary को cross नहीं करना चाहिए। "
+          "उदाहरण: 2 Hours का zone 1 Hour पर वैलिडेट होगा, 1 Hour का zone 30 Min पर, आदि। "
+          "इससे कम zones मिलेंगी पर हर zone ज़्यादा भरोसेमंद होगी। '3 Min' टाइमफ्रेम के लिए यह "
+          "check skip होगा (उससे नीचे कोई TF उपलब्ध नहीं है)।")
+)
+if use_mtf_validation:
+    st.sidebar.caption("🔬 MTF validation ON — scan थोड़ा धीमा होगा (हर TF के लिए एक निचला TF भी fetch होगा)।")
 
 # ============================== ALERTS STATE ==============================
 if "alerts" not in st.session_state:
@@ -612,7 +803,7 @@ def unified_yf_download_engine(tickers_tuple: Tuple[str, ...], period: str = "10
     try:
         data = yf.download(tickers, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
     except Exception: return {}
-    
+
     out = {}
     for t in tickers:
         try:
@@ -626,7 +817,7 @@ def get_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     """Fetches Live and Daily Quotes using Unified Download Engine"""
     daily_data = unified_yf_download_engine(tuple(tickers), period="10d", interval="1d")
     intraday_data = unified_yf_download_engine(tuple(tickers), period="1d", interval="5m")
-    
+
     quotes = {}
     for t in tickers:
         df_d = daily_data.get(t)
@@ -634,7 +825,7 @@ def get_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         last, prev = df_d["Close"].iloc[-1], df_d["Close"].iloc[-2]
         chg = last - prev
         pct = (chg / prev) * 100
-        
+
         df_intra = intraday_data.get(t)
         live_price = df_intra["Close"].iloc[-1] if df_intra is not None and len(df_intra) > 0 else last
         quotes[t] = {"price": live_price, "pct": pct, "chg": chg}
@@ -646,9 +837,9 @@ def fetch_tf_data_single_v2(tf_key: str, items_tuple: Tuple):
     cfg = TIMEFRAMES[tf_key]
     yf_symbols = [item[1] for item in items_tuple]
     if not yf_symbols: return {}
-    
+
     data = unified_yf_download_engine(tuple(yf_symbols), period=cfg["period"], interval=cfg["interval"])
-    
+
     out = {}
     for display_name, yf_sym, tv_sym, cat in items_tuple:
         df = data.get(yf_sym)
@@ -837,27 +1028,27 @@ def fetch_nse_corporate_announcements():
 # ============================== TABS ORDER ==============================
 # Signals, Alerts, Global, News: AUTO-REFRESH ALWAYS ACTIVE
 # Sector, Watchlist, Calendar, FII/DII, Delivery, Gainers/Losers: DEFERRED EXECUTION ON TOUCH
-(tab_signals, tab_alerts, tab_global, tab_news, tab_sector, tab_stocks, 
+(tab_signals, tab_alerts, tab_global, tab_news, tab_sector, tab_stocks,
  tab_calendar, tab_fii, tab_delivery, tab_movers) = st.tabs([
-    "📊 Signals", "🔔 Alerts", "🌍 Global", "📰 News & AI Hypothesis", 
-    "🏭 Sector Impact", "📋 Watchlist", "🗓️ Calendar", "💰 FII/DII+Nifty", 
+    "📊 Signals", "🔔 Alerts", "🌍 Global", "📰 News & AI Hypothesis",
+    "🏭 Sector Impact", "📋 Watchlist", "🗓️ Calendar", "💰 FII/DII+Nifty",
     "📦 Delivery%+Deals", "🏆 Gainers/Losers"
 ])
 
 # ---------- TAB 1: FAST EMA/VOLUME/RSI & INSTITUTIONAL D&S SIGNALS (AUTO-REFRESH) ----------
 with tab_signals:
-    st.subheader("D&S tech.Scanner")
-    
+    st.subheader("📊 Institutional D&S + Technical Multi-Asset Scanner")
+
     is_after_close = now_ist().hour >= 16 or now_ist().hour < 8
     if is_after_close:
         st.info("🌙 भारतीय बाज़ार बंद है — भारतीय स्टॉक्स के लिए Daily स्कैन और **ग्लोबल मार्केट (Gold, Crude, Forex, US Yields, Global Indices)** के लिए Live Multi-timeframe स्कैन चालू है।")
 
     all_scan_items = []
-    
+
     if "Indian Watchlist" in scan_scope:
         for s in selected_stocks:
             all_scan_items.append((s, yf_ticker_for_stock(s), tv_symbol_for_stock(s), "🇮🇳 Stock"))
-            
+
     if "Global Markets (Commodities/FX/Bonds/Indices)" in scan_scope:
         for sym, name, yft, tvs in GLOBAL_INSTRUMENTS:
             if yft:
@@ -866,8 +1057,17 @@ with tab_signals:
     if not signal_timeframes or not all_scan_items:
         st.warning("कृपया साइडबार से कम से कम एक Timeframe और Scope सलेक्ट करें।")
     else:
+        # ---- Determine which extra "lower" timeframes must ALSO be fetched
+        #      when MTF No-Break Validation is enabled ----
+        required_tfs = set(signal_timeframes)
+        if use_mtf_validation:
+            for tf_key in signal_timeframes:
+                lower_tf = LOWER_TF_MAP.get(tf_key)
+                if lower_tf:
+                    required_tfs.add(lower_tf)
+
         with st.spinner("⚡ Fast Scanning (Demand/Supply Zones + EMA/Volume/RSI) चल रहा है..."):
-            all_tf_data = fetch_all_tf_data_fast_v2(tuple(signal_timeframes), tuple(all_scan_items))
+            all_tf_data = fetch_all_tf_data_fast_v2(tuple(required_tfs), tuple(all_scan_items))
 
         rows = []
         existing_keys = {a["key"] for a in st.session_state.alerts}
@@ -875,17 +1075,19 @@ with tab_signals:
         for tf_key in signal_timeframes:
             tf_is_intraday = TIMEFRAMES[tf_key]["intraday"]
             tf_data = all_tf_data.get(tf_key, {})
-            
+            lower_tf_key = LOWER_TF_MAP.get(tf_key) if use_mtf_validation else None
+            lower_tf_data_for_this_tf = all_tf_data.get(lower_tf_key, {}) if lower_tf_key else {}
+
             for item_name, item_dict in tf_data.items():
                 cat = item_dict["category"]
-                
+
                 if is_after_close and tf_is_intraday and cat == "🇮🇳 Stock":
                     continue
-                    
+
                 df = item_dict["df"]
                 tv_sym = item_dict["tv"]
                 price, bar_time = df["Close"].iloc[-1], df.index[-1]
-                
+
                 # NumPy High-Speed Array Conversion
                 close_np = df["Close"].to_numpy(dtype=np.float64)
                 vol_np = df["Volume"].to_numpy(dtype=np.float64)
@@ -894,9 +1096,11 @@ with tab_signals:
                 is_daily_vol_spike = False
                 is_hq_ds_zone = False
 
-                # 1. Institutional D&S Zone Scanner
+                # 1. Institutional D&S Zone Scanner (Refined v2, optional MTF validation)
                 if "Institutional D&S Zones (Demand/Supply)" in selected_indicators:
-                    ds_sig, is_hq = check_ds_zones(df)
+                    lower_item = lower_tf_data_for_this_tf.get(item_name)
+                    lower_df = lower_item["df"] if lower_item else None
+                    ds_sig, is_hq = check_ds_zones(df, lower_tf_df=lower_df, use_mtf=use_mtf_validation)
                     if ds_sig:
                         type_parts.append(ds_sig)
                         if is_hq: is_hq_ds_zone = True
@@ -1038,26 +1242,26 @@ with tab_global:
 
     # ---------- TAB 4: ADVANCED AI MARKET INTELLIGENCE & HYPOTHESIS ENGINE (AUTO-REFRESH) ----------
 with tab_news:
-    st.subheader("AI Market Inte & Op. Hypothesis ")
+    st.subheader("🤖 Real-Time AI Market Intelligence & Opening Hypothesis Engine")
     st.caption("Live Price/Volume + Option OI/PCR + Macro Drivers + Top 10 Stocks OI + FII/DII Trends + Global Cues")
 
-    with st.spinner("AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
+    with st.spinner("🤖 AI Engine मल्टी-स्ट्रीम डेटा (ग्लोबल, FII/DII, OI/PCR, टॉप स्टॉक्स) एनालाइज कर रहा है..."):
         # 1. Macro Quotes Fetching
         macro_symbols = [g[2] for g in GLOBAL_INSTRUMENTS if g[2]]
         macro_quotes = get_quotes(macro_symbols) if 'get_quotes' in globals() else {}
-        
+
         usdinr_data = macro_quotes.get("INR=X", {})
         crude_data = macro_quotes.get("CL=F", {})
         sp500_data = macro_quotes.get("^GSPC", {})
         dxy_data = macro_quotes.get("DX-Y.NYB", {})
         us10y_data = macro_quotes.get("^TNX", {})
         gold_data = macro_quotes.get("GC=F", {})
-        
+
         crude_pct = crude_data.get("pct", 0) if crude_data else 0
         sp500_pct = sp500_data.get("pct", 0) if sp500_data else 0
         dxy_pct = dxy_data.get("pct", 0) if dxy_data else 0
         us10y_pct = us10y_data.get("pct", 0) if us10y_data else 0
-        
+
         # 2. FII / DII Data Fetch & Analysis
         fii_df = None
         if 'fetch_fii_dii' in globals():
@@ -1065,7 +1269,7 @@ with tab_news:
                 fii_df, _ = fetch_fii_dii()
             except Exception:
                 fii_df = None
-                
+
         fii_net_val, dii_net_val = 0, 0
         fii_bullish, fii_bearish = False, False
         if fii_df is not None and not fii_df.empty:
@@ -1093,7 +1297,7 @@ with tab_news:
                 total_call_oi = sum(r["CE"]["openInterest"] for r in records if "CE" in r)
                 total_put_oi = sum(r["PE"]["openInterest"] for r in records if "PE" in r)
                 if total_call_oi > 0: pcr_value = round(total_put_oi / total_call_oi, 2)
-                
+
                 call_oi_map = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
                 put_oi_map = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
                 if call_oi_map: max_call_oi_strike = max(call_oi_map, key=call_oi_map.get)
@@ -1104,13 +1308,13 @@ with tab_news:
     overnight_score = 0
     if sp500_pct > 0.4: overnight_score += 1.5
     elif sp500_pct < -0.4: overnight_score -= 1.5
-    
+
     if pcr_value > 1.1: overnight_score += 1.0
     elif pcr_value < 0.8: overnight_score -= 1.0
-    
+
     if crude_pct < -1.0: overnight_score += 1.0
     elif crude_pct > 1.0: overnight_score -= 1.0
-    
+
     if fii_bullish: overnight_score += 1.0
     elif fii_bearish: overnight_score -= 1.0
 
@@ -1131,9 +1335,9 @@ with tab_news:
         bias_text = "न्यूट्रल / रेंजबाउंड (Breakout/Breakdown Confirmation Required)"
 
     # Top Opening Hypothesis Banner
-    st.markdown(" Closing Analysis & Opening Hypothesis")
+    st.markdown("### 🌅 Closing Analysis & Opening Hypothesis")
     col_h1, col_h2 = st.columns([1.3, 1])
-    
+
     with col_h1:
         st.markdown(
             f"""
@@ -1163,10 +1367,10 @@ with tab_news:
     st.markdown("---")
 
     # Smart Trader Deep Dive Sections (Bullet Points format)
-    st.markdown("Intraday Smart Trader AI Market Hypothesis & Multi-Stream Analysis")
+    st.markdown("## 🧠 Intraday Smart Trader AI Market Hypothesis & Multi-Stream Analysis")
 
     # Section 1: Global Instruments & Macro Cues
-    st.markdown("1. ग्लोबल इंस्ट्रूमेंट्स, क्रूड & कमोडिटी सेंटीमेंट")
+    st.markdown("### 🌐 1. ग्लोबल इंस्ट्रूमेंट्स, क्रूड & कमोडिटी सेंटीमेंट")
     st.markdown("""
 * **US Dollar Index (DXY) & USD/INR:** डॉलर इंडेक्स में मजबूती इमर्जिंग मार्केट्स (भारत) से FII आउटफ्लो का दबाव बनाती है। DXY का 104 के ऊपर स्थिर होना रुपया (USD/INR) पर दबाव डालता है।
 * **US 10-Yr Treasury Yield (^TNX) & TLT:** बॉन्ड यील्ड में 4.2%+ की बढ़त रिस्क-ऑफ (Risk-Off) सेंटीमेंट लाती है, जिससे इक्विटी मार्केट्स में प्रॉफिट बुकिंग देखने को मिलती है।
@@ -1176,7 +1380,7 @@ with tab_news:
 """)
 
     # Section 2: FII & DII Data Analysis
-    st.markdown("2. FII & DII पिछले 2-3 दिनों का फ्लो डेटा एनालिसिस")
+    st.markdown("### 🏦 2. FII & DII पिछले 2-3 दिनों का फ्लो डेटा एनालिसिस")
     st.markdown(f"""
 * **FII Net Cash Activity:** हालिया आंकड़े दर्शा रहे हैं कि FII की नेट वैल्यू **₹{fii_net_val} Cr** रही। {'FIIs नेट बायर्स हैं जो मार्केट को संस्थागत मजबूती दे रहे हैं।' if fii_net_val > 0 else 'FIIs कैश सेगमेंट में नेट सेलर हैं, जो ऊपरी स्तरों पर सप्लाई प्रेशर दर्शाता है।'}
 * **DII Net Cash Activity:** DIIs म्यूचुअल फंड SIP इनफ्लो के दम पर **₹{dii_net_val if dii_net_val else 'सकारात्मक'} Cr** का नेट सपोर्ट दे रहे हैं, जिससे बाजार में हर गिरावट पर बाइंग (Dip buying) की ताकत बनी हुई है।
@@ -1184,7 +1388,7 @@ with tab_news:
 """)
 
     # Section 3: Option Chain OI & PCR Structure
-    st.markdown(" 3. Nifty Option Chain, PCR & Strike Level Dynamic")
+    st.markdown("### 🎯 3. Nifty Option Chain, PCR & Strike Level Dynamic")
     st.markdown(f"""
 * **Current Put-Call Ratio (PCR):** निफ्टी का PCR वर्तमान में **{pcr_value}** है।
   * *PCR > 1.2:* ओवरसोल्ड रिकवरी या स्ट्रॉन्ग बुलिश सेंटीमेंट (पुट राइटिंग हैवी)।
@@ -1196,7 +1400,7 @@ with tab_news:
 
     # Section 4: Top 10 Weighted Stocks
     st.markdown("### 🏢 4. Nifty 50 टॉप 10 वेटेज स्टॉक्स OI & सेक्टोरल ट्रेंड")
-    
+
     top10_data = [
         {"Stock": "HDFC Bank (HDFCBANK)", "Weight": "~11.5%", "Impact Sector": "Banking & Financials", "OI Sentiment": "इंडेक्स का मुख्य डायरेक्शनल लीडर"},
         {"Stock": "Reliance Industries (RELIANCE)", "Weight": "~9.8%", "Impact Sector": "Energy & Telecom", "OI Sentiment": "हैवीवेट निफ्टी मूवर"},
@@ -1251,7 +1455,7 @@ with tab_news:
         st.dataframe(filings_df, use_container_width=True, hide_index=True)
     else:
         st.info("हाल ही में कोई मुख्य कॉरपोरेट अनाउंसमेंट नहीं मिला।")
-            
+
 
 # ---------- TAB 5: SECTOR INDEX & IMPACT (DEFERRED LOAD ON TOUCH) ----------
 with tab_sector:
