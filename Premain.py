@@ -1,10 +1,11 @@
 """
-app.py — Full Market Dashboard (Streamlit) + Incremental D&S Cache + AI Hypothesis
+app.py — Full Market Dashboard (Streamlit) + Incremental D&S Cache + AI Hypothesis + Market Pulse
 =====================================================================================
-Institutional D&S Zones (incremental/cached scan) | EMA/Volume/RSI Signals |
+Institutional D&S Zones (incremental/cached scan, sensitivity-mode) | EMA/Volume/RSI Signals |
 Global Markets | Sector Impact | Watchlist | Economic Calendar | FII/DII + Nifty OI |
 Delivery% + Bulk/Block Deals | Gainers/Losers | Evidence-Based AI Buy/Sell Hypothesis |
-Mobile-Friendly UI.
+🌅 Market Pulse (Pre-Market / Live Snapshot: GIFT Nifty, Nifty/BankNifty, Sectors, Global,
+OI/PCR, FII/DII, Heavyweights, News, Overall Bias) | Mobile-Friendly UI.
 
 ⚠️ EDUCATIONAL / INFORMATIONAL TOOL — SEBI-registered निवेश सलाह नहीं है।
 """
@@ -64,7 +65,13 @@ LEG_OUT_VOL_MULT        = 1.5
 MTF_BUFFER_ATR_MULT     = 0.15
 
 # 🆕 Incremental Zone-Scan Cache Config
-CONTEXT_BUFFER = 40   # leg-in/base lookback के लिए सुरक्षित buffer (नए-bar scan में)
+# (पहले यह 40 था — इतना छोटा buffer ATR/swing-context को हर refresh पर तोड़ देता था
+#  जिससे sweep-filter झूठा false हो जाता था और नए zones आना बंद हो जाते थे)
+CONTEXT_BUFFER = 300
+
+# 🆕 D&S Sensitivity Mode — sidebar से override होता है (default यहां रखा है ताकि
+# किसी भी हालत में NameError न आए)
+ds_mode = "Balanced"
 
 # ==========================================
 # 2. VECTORIZED NUMPY CALCULATIONS
@@ -159,7 +166,10 @@ def scan_institutional_ds_zones(df: pd.DataFrame, lower_tf_df: Optional[pd.DataF
                                  use_mtf: bool = False) -> List[Zone]:
     """Core (non-incremental) zone-detection engine — किसी भी दिए गए df-slice पर पूरा scan करता है।
     Incremental caching wrapper (नीचे) इसे सिर्फ नए bars के छोटे slice पर call करता है, इसलिए
-    यह function खुद नहीं बदला — बस इसे कम बार, छोटे data पर बुलाया जाता है।"""
+    यह function खुद नहीं बदला — बस इसे कम बार, छोटे data पर बुलाया जाता है।
+    ⚠️ NOTE: USE_SWEEP_FILTER, USE_IMBALANCE, LEG_OUT_ATR_MULT, MAX_WICK_PCT, LEG_OUT_VOL_MULT
+    ये सारे module-level globals हैं और sidebar के "D&S Sensitivity Mode" से runtime पर override
+    होते हैं — इसलिए यह function उन्हें हमेशा current (ताज़ा) value के साथ पढ़ेगा।"""
     if df is None or len(df) < 30:
         return []
 
@@ -347,7 +357,8 @@ def scan_institutional_ds_zones(df: pd.DataFrame, lower_tf_df: Optional[pd.DataF
 # 🆕 2c. INCREMENTAL / CACHED D&S ZONE SCANNER
 # ==========================================
 def _ds_cache_key(symbol: str, tf_key: str, use_mtf: bool) -> str:
-    return f"{symbol}::{tf_key}::mtf{int(use_mtf)}"
+    # 🆕 ds_mode भी key में जोड़ा — ताकि sensitivity mode बदलने पर पुराना (गलत) cache इस्तेमाल न हो
+    return f"{symbol}::{tf_key}::mtf{int(use_mtf)}::{ds_mode}"
 
 def scan_institutional_ds_zones_incremental(df: pd.DataFrame, symbol: str, tf_key: str,
                                              lower_tf_df: Optional[pd.DataFrame] = None,
@@ -359,6 +370,9 @@ def scan_institutional_ds_zones_incremental(df: pd.DataFrame, symbol: str, tf_ke
       3. बाद में -> सिर्फ (timestamp-आधारित) नए bars + CONTEXT_BUFFER पर scan,
          पुराने zones की state सिर्फ नए bars पर update होती है (index-shift-safe,
          क्योंकि touch/fill check हमेशा price-level पर होता है, position पर नहीं)।
+      🆕 अगर CONTEXT_BUFFER, history की शुरुआत तक पहुंच जाए (यानी scan_start==0),
+         तो ATR/swing-pivot warm-up context खोने से बचने के लिए पूरा rescan किया जाता है
+         (यह सस्ता ही रहता है क्योंकि ऐसा सिर्फ शुरुआती bars के लिए होता है)।
     """
     if df is None or df.empty:
         return []
@@ -392,6 +406,14 @@ def scan_institutional_ds_zones_incremental(df: pd.DataFrame, symbol: str, tf_ke
     new_positions = np.where(new_mask)[0]
     first_new_pos = int(new_positions[0])
     scan_start = max(0, first_new_pos - CONTEXT_BUFFER)
+
+    # 🆕 अगर buffer history की शुरुआत तक पहुंच जाए तो ATR/swing-context सही रखने के लिए
+    # पूरा rescan करें (यही असली bug था — छोटे slice में ATR/swing warm-up गलत आता था)
+    if scan_start == 0:
+        zones = scan_institutional_ds_zones(df, lower_tf_df=lower_tf_df, use_mtf=use_mtf)
+        st.session_state.ds_zone_cache[key] = {"zones": zones, "last_ts": last_bar_time}
+        return zones
+
     sub_df = df.iloc[scan_start:]
 
     # नए candidates सिर्फ छोटे sub_df पर (सस्ता compute)
@@ -1068,6 +1090,73 @@ def fetch_stock_news_items_full(stock_name: str, max_items: int = 6) -> List[Dic
 
 
 # ==========================================
+# 🆕 4b. MARKET-WIDE OVERALL BIAS (Market Pulse के लिए) — evidence-engine reuse
+# ==========================================
+def build_market_overall_bias(idx_quotes: Dict[str, Dict[str, Any]],
+                               sector_quotes_raw: Dict[str, Dict[str, Any]],
+                               global_quotes: Dict[str, Dict[str, Any]],
+                               pcr_value: Optional[float],
+                               fii_net: Optional[float], dii_net: Optional[float],
+                               market_news: List[Dict[str, Any]]) -> Hypothesis:
+    """पूरे मार्केट (Nifty/BankNifty/Sectors/Global/OI/FII/News) को मिलाकर
+    एक overall evidence-based bias बनाता है — बिल्कुल उसी engine से जो single-stock
+    hypothesis के लिए इस्तेमाल होता है, इसलिए तर्क में consistency रहती है।"""
+    evid: List[EvidenceItem] = []
+
+    n = idx_quotes.get("^NSEI")
+    if n and n.get("pct") is not None and abs(n["pct"]) >= 0.15:
+        d = "bullish" if n["pct"] > 0 else "bearish"
+        evid.append(EvidenceItem("Nifty 50", f"Nifty {n['pct']:+.2f}%", d, 1.5, 1.0))
+
+    bn = idx_quotes.get("^NSEBANK")
+    if bn and bn.get("pct") is not None and abs(bn["pct"]) >= 0.15:
+        d = "bullish" if bn["pct"] > 0 else "bearish"
+        evid.append(EvidenceItem("Bank Nifty", f"Bank Nifty {bn['pct']:+.2f}%", d, 1.2, 1.0))
+
+    for name, yft in SECTOR_INDEX_TICKERS.items():
+        q = sector_quotes_raw.get(yft)
+        if q and q.get("pct") is not None and abs(q["pct"]) >= 0.4:
+            d = "bullish" if q["pct"] > 0 else "bearish"
+            evid.append(EvidenceItem("Sector", f"{name} {q['pct']:+.2f}%", d, W_SECTOR_MOVE, 0.8))
+
+    for label, yft in [("Global - S&P500", "^GSPC"), ("Global - Dow", "^DJI"),
+                        ("Global - Nikkei", "^N225"), ("USD/INR", "INR=X"),
+                        ("US 10Y Yield", "^TNX"), ("Crude Oil", "CL=F")]:
+        q = global_quotes.get(yft)
+        if q and q.get("pct") is not None and abs(q["pct"]) >= 0.3:
+            # USD/INR ऊपर जाना रुपये के कमज़ोर होने का संकेत — import-heavy sectors के लिए सामान्यतः negative
+            if yft == "INR=X":
+                d = "bearish" if q["pct"] > 0 else "bullish"
+            else:
+                d = "bullish" if q["pct"] > 0 else "bearish"
+            evid.append(EvidenceItem(label, f"{q['pct']:+.2f}%", d, W_MACRO_BROAD, 0.7))
+
+    evid += collect_fii_dii_evidence(fii_net, dii_net)
+
+    if pcr_value is not None:
+        if pcr_value > 1.15:
+            evid.append(EvidenceItem("Options - Nifty PCR", f"PCR {pcr_value} (>1.15) — put-heavy bullish bias",
+                                      "bullish", W_OPTIONS_PCR, 0.6))
+        elif pcr_value < 0.80:
+            evid.append(EvidenceItem("Options - Nifty PCR", f"PCR {pcr_value} (<0.80) — call-heavy bearish bias",
+                                      "bearish", W_OPTIONS_PCR, 0.6))
+
+    for item in (market_news or [])[:8]:
+        res = score_text_sentiment(item.get("title", ""))
+        if res["direction"] != "neutral":
+            conf = _freshness_confidence(item.get("published"))
+            evid.append(EvidenceItem("Market News", item.get("title", "")[:90], res["direction"], W_NEWS_KEYWORD, conf))
+
+    score = sum(e.signed_score for e in evid)
+    bull = sum(1 for e in evid if e.direction == "bullish")
+    bear = sum(1 for e in evid if e.direction == "bearish")
+    label = classify_score(score, bull + bear)
+    conf = confidence_label(bull, bear)
+    evid.sort(key=lambda e: abs(e.signed_score), reverse=True)
+    return Hypothesis("NIFTY / Overall Market", None, label, round(score, 2), conf, bull, bear, evid)
+
+
+# ==========================================
 # 5. SIDEBAR SETTINGS
 # ==========================================
 st.sidebar.header("⚙️ Settings")
@@ -1102,6 +1191,57 @@ vol_mult = st.sidebar.slider("Volume Spike Multiplier", 1.5, 5.0, 2.0, 0.5)
 
 st.sidebar.markdown("---")
 use_mtf_validation = st.sidebar.checkbox("🔬 Multi-Timeframe No-Break Validation (सख्त, धीमा)", value=False)
+
+# ==========================================
+# 🆕 D&S ZONE SENSITIVITY MODE
+# ==========================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎚️ D&S Zone Sensitivity")
+ds_mode = st.sidebar.radio(
+    "Detection Mode",
+    ["Strict (Institutional)", "Balanced", "Relaxed (ज़्यादा सिग्नल)"],
+    index=1
+)
+
+if ds_mode == "Strict (Institutional)":
+    USE_SWEEP_FILTER, USE_IMBALANCE = True, True
+    LEG_OUT_ATR_MULT, MAX_WICK_PCT, LEG_OUT_VOL_MULT = 1.2, 0.25, 1.5
+elif ds_mode == "Balanced":
+    USE_SWEEP_FILTER, USE_IMBALANCE = False, True
+    LEG_OUT_ATR_MULT, MAX_WICK_PCT, LEG_OUT_VOL_MULT = 1.0, 0.30, 1.2
+else:  # Relaxed
+    USE_SWEEP_FILTER, USE_IMBALANCE = False, False
+    LEG_OUT_ATR_MULT, MAX_WICK_PCT, LEG_OUT_VOL_MULT = 0.8, 0.35, 1.0
+
+st.sidebar.caption(f"मौजूदा mode: **{ds_mode}** — ज़ोन ज़्यादा/कम मिलने का सीधा असर इसी पर है।"
+                    " Strict = कम पर उच्च-गुणवत्ता वाले zones, Relaxed = ज़्यादा zones पर कम सख्त।")
+
+with st.sidebar.expander("🐞 D&S Debug Info"):
+    st.write(f"Mode: {ds_mode}")
+    st.write(f"USE_SWEEP_FILTER={USE_SWEEP_FILTER}, USE_IMBALANCE={USE_IMBALANCE}")
+    st.write(f"LEG_OUT_ATR_MULT={LEG_OUT_ATR_MULT}, MAX_WICK_PCT={MAX_WICK_PCT}, LEG_OUT_VOL_MULT={LEG_OUT_VOL_MULT}")
+    st.write(f"CONTEXT_BUFFER={CONTEXT_BUFFER}")
+
+# ==========================================
+# 🆕 GIFT Nifty (Manual Input — free auto-fetch उपलब्ध नहीं है)
+# ==========================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌅 GIFT Nifty (Manual)")
+st.sidebar.caption("GIFT Nifty का कोई free/official yfinance ticker उपलब्ध नहीं — कृपया मैन्युअली डालें (optional)।")
+manual_gift_pct = st.sidebar.text_input("GIFT Nifty % change (जैसे +0.35)", value="")
+if manual_gift_pct.strip():
+    st.session_state["manual_gift_nifty_pct"] = manual_gift_pct.strip()
+
+def get_gift_nifty_display() -> str:
+    v = st.session_state.get("manual_gift_nifty_pct")
+    if v:
+        try:
+            f = float(v.replace("%", "").replace("+", ""))
+            arrow = "🟢▲" if f > 0 else ("🔴▼" if f < 0 else "⚪●")
+            return f"{arrow} {f:+.2f}% (manual)"
+        except Exception:
+            return f"{v} (manual)"
+    return "उपलब्ध नहीं — sidebar से डालें"
 
 if "alerts" not in st.session_state: st.session_state.alerts = []
 if "alerts_clear_date" not in st.session_state: st.session_state.alerts_clear_date = None
@@ -1255,6 +1395,139 @@ def fetch_nse_corporate_announcements():
                           "time": d.get("an_dt") or d.get("sort_date") or ""})
         except Exception: continue
     return items
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_market_wide_news(max_items=10) -> List[Dict[str, Any]]:
+    """🆕 पूरे मार्केट (Nifty/Sensex/भारतीय बाज़ार) से जुड़ी ताज़ा headlines — Market Pulse के लिए।"""
+    if feedparser is None:
+        return []
+    query = urllib.parse.quote_plus("Nifty Sensex Indian stock market when:1d")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    items = []
+    try:
+        feed = feedparser.parse(requests.get(url, timeout=8, headers=NSE_HEADERS).content)
+        for e in feed.entries[:max_items]:
+            pub = e.get("published_parsed")
+            pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
+            items.append({
+                "title": e.get("title", ""), "link": e.get("link", ""), "published": pub_dt,
+                "published_str": pub_dt.astimezone(IST).strftime("%H:%M %d-%b") if pub_dt else "",
+            })
+    except Exception:
+        pass
+    return items
+
+
+# ==========================================
+# 🆕 6b. MARKET PULSE — Pre-Market / Live Snapshot Renderer
+# ==========================================
+def render_market_pulse():
+    """एक-नज़र में पूरा मार्केट सेंटीमेंट: GIFT Nifty, Nifty/BankNifty, सेक्टर, ग्लोबल मार्केट्स,
+    OI/PCR, FII/DII, प्रमुख स्टॉक्स, ताज़ा न्यूज़ और अंत में evidence-based Overall Market Bias।"""
+    st.markdown("### 🌅 Market Pulse — प्री-मार्केट / लाइव स्नैपशॉट")
+    st.caption("एक-नज़र में: GIFT Nifty, Nifty/BankNifty, सेक्टर, ग्लोबल मार्केट्स, OI/PCR, FII/DII, टॉप स्टॉक्स, न्यूज़")
+
+    # --- Row 1: GIFT Nifty + Nifty + Bank Nifty ---
+    idx_quotes = get_quotes(["^NSEI", "^NSEBANK"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("GIFT Nifty", get_gift_nifty_display())
+    with c2:
+        n = idx_quotes.get("^NSEI")
+        st.metric("Nifty 50", f"{n['price']:.2f}" if n else "—", f"{n['pct']:+.2f}%" if n else None)
+    with c3:
+        bn = idx_quotes.get("^NSEBANK")
+        st.metric("Bank Nifty", f"{bn['price']:.2f}" if bn else "—", f"{bn['pct']:+.2f}%" if bn else None)
+
+    # --- Row 2: सेक्टर सेंटीमेंट ---
+    st.markdown("#### 🏭 सेक्टर सेंटीमेंट")
+    sector_quotes_raw = get_quotes(list(SECTOR_INDEX_TICKERS.values()))
+    sec_df = pd.DataFrame([
+        {"Sector": name, "% Chg": sector_quotes_raw.get(yft, {}).get("pct")}
+        for name, yft in SECTOR_INDEX_TICKERS.items()
+    ])
+    sec_df["% Chg"] = sec_df["% Chg"].apply(lambda v: f"{v:+.2f}%" if v is not None else "—")
+    st.dataframe(style_pct_columns(sec_df, ["% Chg"]), use_container_width=True, hide_index=True)
+
+    # --- Row 3: ग्लोबल मार्केट्स ---
+    st.markdown("#### 🌍 ग्लोबल मार्केट्स")
+    global_quotes = get_quotes([g[2] for g in GLOBAL_INSTRUMENTS if g[2]])
+    g_df = pd.DataFrame([
+        {"Instrument": name, "% Chg": global_quotes.get(yft, {}).get("pct")}
+        for _, name, yft, _ in GLOBAL_INSTRUMENTS
+    ])
+    g_df["% Chg"] = g_df["% Chg"].apply(lambda v: f"{v:+.2f}%" if v is not None else "—")
+    st.dataframe(style_pct_columns(g_df, ["% Chg"]), use_container_width=True, hide_index=True)
+
+    # --- Row 4: Options / OI / PCR ---
+    st.markdown("#### 📌 Options: Nifty PCR & OI")
+    oc_data = fetch_nse_json("/api/option-chain-indices?symbol=NIFTY")
+    pcr_value = None
+    if oc_data:
+        try:
+            records = oc_data["records"]["data"]
+            call_oi = {r["strikePrice"]: r["CE"]["openInterest"] for r in records if "CE" in r}
+            put_oi = {r["strikePrice"]: r["PE"]["openInterest"] for r in records if "PE" in r}
+            tc, tp = sum(call_oi.values()), sum(put_oi.values())
+            pcr_value = round(tp / tc, 2) if tc else None
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("PCR", pcr_value if pcr_value is not None else "—")
+            oc2.metric("Resistance (Max Call OI)", max(call_oi, key=call_oi.get) if call_oi else "—")
+            oc3.metric("Support (Max Put OI)", max(put_oi, key=put_oi.get) if put_oi else "—")
+        except Exception:
+            st.warning("Option chain data parse नहीं हो सका।")
+    else:
+        st.caption("Option chain data अभी उपलब्ध नहीं (NSE rate-limit हो सकता है)।")
+
+    # --- Row 5: FII / DII ---
+    st.markdown("#### 💰 FII / DII (पिछला EOD)")
+    fii_df, source = fetch_fii_dii()
+    fii_net_val = dii_net_val = None
+    if fii_df is not None:
+        st.dataframe(fii_df, use_container_width=True, hide_index=True)
+        try:
+            net_col = [c for c in fii_df.columns if "net" in c.lower()][0]
+            cat_col = [c for c in fii_df.columns if "cat" in c.lower()][0]
+            for _, r in fii_df.iterrows():
+                if "FII" in str(r[cat_col]).upper(): fii_net_val = float(r[net_col])
+                elif "DII" in str(r[cat_col]).upper(): dii_net_val = float(r[net_col])
+            insight = fii_dii_insight(fii_df)
+            if insight: getattr(st, insight[0])(insight[1])
+        except Exception:
+            pass
+        st.caption(f"Source: {source}")
+    else:
+        st.caption("FII/DII data अभी उपलब्ध नहीं।")
+
+    # --- Row 6: प्रमुख स्टॉक्स ---
+    st.markdown("#### 🏆 प्रमुख स्टॉक्स (Nifty Heavyweights)")
+    hw_list = sorted(NIFTY_HEAVYWEIGHTS)
+    hw_quotes = get_quotes([yf_ticker_for_stock(s) for s in hw_list])
+    hw_rows = [{"Stock": s, "% Chg": hw_quotes[yf_ticker_for_stock(s)]["pct"]}
+               for s in hw_list if yf_ticker_for_stock(s) in hw_quotes]
+    if hw_rows:
+        hw_df = pd.DataFrame(hw_rows).sort_values("% Chg", ascending=False)
+        hw_df["% Chg"] = hw_df["% Chg"].apply(lambda v: f"{v:+.2f}%")
+        st.dataframe(style_pct_columns(hw_df, ["% Chg"]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Heavyweight quotes उपलब्ध नहीं।")
+
+    # --- Row 7: ताज़ा News ---
+    st.markdown("#### 📰 ताज़ा Market News")
+    with st.spinner("News scan हो रहा है..."):
+        market_news = fetch_market_wide_news()
+    if market_news:
+        for item in market_news[:8]:
+            st.markdown(f"- [{item['title']}]({item['link']}) · _{item['published_str']}_")
+    else:
+        st.caption("कोई ताज़ा news नहीं मिली।")
+
+    # --- Row 8: Overall Evidence-Based Bias ---
+    st.markdown("---")
+    st.markdown("#### 🧭 ओवरऑल मार्केट बायस (सभी evidence combine करके)")
+    overall = build_market_overall_bias(idx_quotes, sector_quotes_raw, global_quotes,
+                                         pcr_value, fii_net_val, dii_net_val, market_news)
+    render_hypothesis_card(overall)
 
 
 # ==========================================
@@ -1462,6 +1735,17 @@ def render_hypothesis_card(h: Hypothesis):
 
 def render_ai_hypothesis_tab():
     st.subheader("🤖 AI Buy/Sell Hypothesis — Evidence-Based")
+
+    # 🆕 Market Pulse — प्री-मार्केट/लाइव पूरे मार्केट का स्नैपशॉट, single-stock hypothesis से पहले
+    with st.expander("🌅 पहले Market Pulse देखें (प्री-मार्केट/ओपनिंग स्नैपशॉट)", expanded=True):
+        if st.button("🔄 Market Pulse Load/Refresh करें", key="btn_market_pulse"):
+            with st.spinner("पूरे मार्केट का डेटा collect हो रहा है..."):
+                render_market_pulse()
+        else:
+            st.info("बटन दबाकर GIFT Nifty, Nifty/BankNifty, सेक्टर, ग्लोबल मार्केट्स, OI/PCR, FII/DII, "
+                    "प्रमुख स्टॉक्स और ताज़ा न्यूज़ का पूरा स्नैपशॉट देखें।")
+
+    st.markdown("---")
     st.caption("पहले Signals टैब खोलें ताकि तकनीकी evidence collect हो जाए, फिर यहां आएं।")
     if not st.session_state.all_tf_signals_map:
         st.warning("⚠️ पहले '📊 Signals' टैब खोलें ताकि Technical evidence भर जाए।")
